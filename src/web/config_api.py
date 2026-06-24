@@ -88,9 +88,9 @@ def register(mcp) -> None:
         return JSONResponse({"vars": vars_data})
 
 
-    @mcp.custom_route("/api/sh.config", methods=["GET"])
+    @mcp.custom_route("/api/config", methods=["GET"])
     async def api_config_get(request: Request) -> Response:
-        """Get current runtime sh.config (safe fields only, API key masked)."""
+        """Get current runtime config (safe fields only, API key masked)."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -128,9 +128,9 @@ def register(mcp) -> None:
         })
 
 
-    @mcp.custom_route("/api/sh.config", methods=["POST"])
+    @mcp.custom_route("/api/config", methods=["POST"])
     async def api_config_update(request: Request) -> Response:
-        """Hot-update runtime sh.config. Optionally persist to sh.config.yaml."""
+        """Hot-update runtime sh.config. Optionally persist to config.yaml."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -142,7 +142,7 @@ def register(mcp) -> None:
 
         updated = []
 
-        # --- Dehydration sh.config ---
+        # --- Dehydration config ---
         if "dehydration" in body:
             d = body["dehydration"]
             dehy = sh.config.setdefault("dehydration", {})
@@ -153,7 +153,7 @@ def register(mcp) -> None:
             if "api_key" in d and d["api_key"]:
                 dehy["api_key"] = d["api_key"]
                 updated.append("dehydration.api_key")
-            # Hot-reload sh.dehydrator — sync ALL attributes so dashboard changes take effect immediately
+            # Hot-reload dehydrator — sync ALL attributes so dashboard changes take effect immediately
             sh.dehydrator.model = dehy.get("model", sh.dehydrator.model)
             sh.dehydrator.base_url = dehy.get("base_url", sh.dehydrator.base_url)
             sh.dehydrator.max_tokens = int(dehy.get("max_tokens") or sh.dehydrator.max_tokens)
@@ -173,7 +173,7 @@ def register(mcp) -> None:
             else:
                 sh.dehydrator.client = None
 
-        # --- Embedding sh.config ---
+        # --- Embedding config ---
         if "embedding" in body:
             e = body["embedding"]
             emb = sh.config.setdefault("embedding", {})
@@ -229,7 +229,7 @@ def register(mcp) -> None:
                     except (TypeError, ValueError):
                         pass
 
-        # --- Persist to sh.config.yaml if requested ---
+        # --- Persist to config.yaml if requested ---
         if body.get("persist", False):
             config_path = os.path.join(sh.repo_root, "config.yaml")
             try:
@@ -312,7 +312,7 @@ def register(mcp) -> None:
         err = sh._require_auth(request)
         if err:
             return err
-        # Use current runtime sh.config (api_key may have been updated in-memory)
+        # Use current runtime config (api_key may have been updated in-memory)
         dehyd = sh.config.get("dehydration", {})
         model = dehyd.get("model", "")
         base_url = dehyd.get("base_url", "")
@@ -394,14 +394,14 @@ def register(mcp) -> None:
         base_url = str(body.get("base_url", "")).strip()
         api_format = str(body.get("api_format", "openai_compat")).strip().lower()
 
-        # Sentinel "__use_current__": use server-side key from dehydration sh.config
+        # Sentinel "__use_current__": use server-side key from dehydration config
         if api_key == "__use_current__":
             api_key = sh.config.get("dehydration", {}).get("api_key", "")
             if not base_url:
                 base_url = sh.config.get("dehydration", {}).get("base_url", "")
             if not api_format or api_format == "openai_compat":
                 api_format = sh.config.get("dehydration", {}).get("api_format", "openai_compat")
-        # Sentinel "__use_current_embed__": use server-side key from embedding sh.config
+        # Sentinel "__use_current_embed__": use server-side key from embedding config
         if api_key == "__use_current_embed__":
             api_key = sh.config.get("embedding", {}).get("api_key", "")
             if not base_url:
@@ -443,9 +443,9 @@ def register(mcp) -> None:
 
 
     # =============================================================
-    # /api/env-sh.config — Dashboard 热更新环境变量（四块：Compress / Embed / Password / Webhook）
+    # /api/env-config — Dashboard 热更新环境变量（四块：Compress / Embed / Password / Webhook）
     # GET  返回当前值（API key 脱敏）
-    # POST 批量更新：同时更新进程内 sh.config + 写 .env 文件持久化
+    # POST 批量更新：同时更新进程内 config + 写 .env 文件持久化
     # =============================================================
 
     # 哪些变量可以从 Dashboard 读写（不能出现在这里之外的变量）
@@ -466,8 +466,8 @@ def register(mcp) -> None:
     }
 
     _ENV_CONFIG_NOTE = {
-        "compress": "改完即时生效（进程内 sh.config 已更新），同时写 sh.config.yaml 持久化（重启后仍有效）。",
-        "embed": "API key / base_url / model 立即更新进程内 sh.config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
+        "compress": "改完即时生效（进程内 sh.config 已更新），同时写 config.yaml 持久化（重启后仍有效）。",
+        "embed": "API key / base_url / model 立即更新进程内 config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
         "webhook": "改完下次 breath/dream 触发时即生效，无需重启。",
     }
 
@@ -481,7 +481,7 @@ def register(mcp) -> None:
         return "***"
 
 
-    @mcp.custom_route("/api/env-sh.config", methods=["GET"])
+    @mcp.custom_route("/api/env-config", methods=["GET"])
     async def api_env_config_get(request: Request) -> Response:
         """
         返回四块配置的当前值（API key 脱敏显示）。
@@ -494,7 +494,7 @@ def register(mcp) -> None:
 
         result: dict[str, dict] = {}
         for var, meta in _ENV_CONFIG_FIELDS.items():
-            # 优先从 sh.config dict 读（进程内最新）
+            # 优先从 config dict 读（进程内最新）
             raw = ""
             if meta["in_memory"]:
                 section, key = meta["in_memory"]
@@ -519,7 +519,7 @@ def register(mcp) -> None:
         })
 
 
-    @mcp.custom_route("/api/env-sh.config", methods=["POST"])
+    @mcp.custom_route("/api/env-config", methods=["POST"])
     async def api_env_config_set(request: Request) -> Response:
         """
         热更新指定环境变量。
@@ -531,9 +531,9 @@ def register(mcp) -> None:
 
         成功返回 {ok, updated: [已写的变量名], .env 路径}。
         """
-        # 必须声明 global：下面第 6 步会 `sh.embedding_engine = EmbeddingEngine(sh.config)` 重建实例。
-        # 缺这行 → 该赋值把 sh.embedding_engine 当函数局部变量，造成：
-        #   1) 清 key 分支 `sh.embedding_engine._backend = None` 触发 UnboundLocalError（被 except 吞掉 → 清 key 没真禁用）；
+        # 必须声明 global：下面第 6 步会 `embedding_engine = EmbeddingEngine(config)` 重建实例。
+        # 缺这行 → 该赋值把 embedding_engine 当函数局部变量，造成：
+        #   1) 清 key 分支 `embedding_engine._backend = None` 触发 UnboundLocalError（被 except 吞掉 → 清 key 没真禁用）；
         #   2) 设新 key 时只更新局部，模块级全局仍指向旧引擎 → /api/embedding/info、search 等读全局处拿到旧/待机引擎，
         #      表现为「在 Dashboard 配了硅基流动等向量化却一直静默不生效」。
         from starlette.responses import JSONResponse
@@ -572,7 +572,7 @@ def register(mcp) -> None:
                 errors.append(f"{var}: 只允许 http:// 或 https:// 开头的 URL，跳过")
                 continue
 
-            # 1. 更新进程内 sh.config dict（影响当次请求之后的业务逻辑）
+            # 1. 更新进程内 config dict（影响当次请求之后的业务逻辑）
             meta = _ENV_CONFIG_FIELDS[var]
             if meta["in_memory"]:
                 section, key = meta["in_memory"]
@@ -584,7 +584,7 @@ def register(mcp) -> None:
             else:
                 os.environ.pop(var, None)
 
-            # 3. 持久化到 sh.config.yaml（bind mount，重建不丢）
+            # 3. 持久化到 config.yaml（bind mount，重建不丢）
             try:
                 _cfg_path = os.path.join(sh.repo_root, "config.yaml")
                 _save: dict = {}
@@ -597,11 +597,11 @@ def register(mcp) -> None:
                 with open(_cfg_path, "w", encoding="utf-8") as _f:
                     yaml.dump(_save, _f, allow_unicode=True, default_flow_style=False)
             except Exception as e:
-                errors.append(f"{var}: 写 sh.config.yaml 失败：{e}")
+                errors.append(f"{var}: 写 config.yaml 失败：{e}")
                 continue
 
 
-            # 5. Compress 配置变更 → 同步到 sh.dehydrator 实例，重建 client
+            # 5. Compress 配置变更 → 同步到 dehydrator 实例，重建 client
             if var in ("OMBRE_COMPRESS_API_KEY", "OMBRE_COMPRESS_BASE_URL", "OMBRE_COMPRESS_MODEL", "OMBRE_COMPRESS_FORMAT"):
                 try:
                     dehy_cfg = sh.config.get("dehydration", {})
@@ -622,7 +622,7 @@ def register(mcp) -> None:
                 except Exception:
                     pass
 
-            # 6. Embed 配置变更 → 完整重建 sh.embedding_engine
+            # 6. Embed 配置变更 → 完整重建 embedding_engine
             if var in ("OMBRE_EMBED_API_KEY", "OMBRE_EMBED_BASE_URL", "OMBRE_EMBED_MODEL", "OMBRE_EMBED_FORMAT"):
                 try:
                     sh.config.setdefault("embedding", {})
@@ -633,7 +633,7 @@ def register(mcp) -> None:
                     else:
                         from sh.embedding_engine import EmbeddingEngine as _EE_hot
                         sh.embedding_engine = _EE_hot(sh.config)
-                        # 更新 sh.bucket_mgr / sh.import_engine 持有的引用
+                        # 更新 bucket_mgr / import_engine 持有的引用
                         try:
                             sh.bucket_mgr.embedding_engine = sh.embedding_engine  # type: ignore[attr-defined]
                         except Exception:
@@ -651,7 +651,7 @@ def register(mcp) -> None:
             "ok": True,
             "updated": written,
             "env_file": sh._project_env_path(),
-            "note": "已同时更新进程内 sh.config 和 sh.config.yaml 文件。敏感字段（API key）重启后仍有效。",
+            "note": "已同时更新进程内 sh.config 和 config.yaml 文件。敏感字段（API key）重启后仍有效。",
         }
         if errors:
             response["warnings"] = errors

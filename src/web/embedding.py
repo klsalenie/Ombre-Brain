@@ -27,9 +27,9 @@ except ImportError:  # pragma: no cover
 
 
 def _persist_embedding_yaml(updates: dict) -> None:
-    """把 embedding 配置写进 sh.config.yaml（bind mount，重启/重建不丢）。
+    """把 embedding 配置写进 config.yaml（bind mount，重启/重建不丢）。
 
-    迁移完成后必须调用：否则切到本地/云端只改了进程内 sh.config，重启后 sh.config.yaml
+    迁移完成后必须调用：否则切到本地/云端只改了进程内 sh.config，重启后 config.yaml
     还是旧的 → 与 embeddings.db 里已重算的向量维度不一致 → OB-W005 / 检索失效。
     """
     try:
@@ -44,7 +44,7 @@ def _persist_embedding_yaml(updates: dict) -> None:
         with open(_cfg_path, "w", encoding="utf-8") as _f:
             yaml.dump(_save, _f, allow_unicode=True, default_flow_style=False)
     except Exception as e:
-        logger.error(f"[migration] persist embedding to sh.config.yaml failed: {e}")
+        logger.error(f"[migration] persist embedding to config.yaml failed: {e}")
 
 
 _DEFAULT_OLLAMA_BASE = "http://ombre-ollama:11434"
@@ -283,7 +283,7 @@ def register(mcp) -> None:
             # 成功 → 把 global engine 切到目标
             try:
                 sh.embedding_engine = target_engine
-                # sh.bucket_mgr / sh.import_engine 持有的引用更新
+                # bucket_mgr / import_engine 持有的引用更新
                 try:
                     sh.bucket_mgr.embedding_engine = target_engine
                 except Exception:
@@ -292,7 +292,7 @@ def register(mcp) -> None:
                     sh.import_engine.embedding_engine = target_engine
                 except Exception:
                     pass
-                # 持久化到 sh.config（进程内 + sh.config.yaml，重启/重建不丢）
+                # 持久化到 config（进程内 + config.yaml，重启/重建不丢）
                 cfg_emb = sh.config.setdefault("embedding", {})
                 cfg_emb["backend"] = target_backend
                 cfg_emb["enabled"] = True
@@ -310,7 +310,7 @@ def register(mcp) -> None:
                     cfg_emb["model"] = str(body["model"]).strip()
                     _yaml_updates["model"] = str(body["model"]).strip()
                 _persist_embedding_yaml(_yaml_updates)
-                logger.info(f"[migration] sh.embedding_engine swapped to backend={target_backend} format={req_api_format or '(unchanged)'}; persisted to sh.config.yaml")
+                logger.info(f"[migration] sh.embedding_engine swapped to backend={target_backend} format={req_api_format or '(unchanged)'}; persisted to config.yaml")
             except Exception as e:
                 logger.error(f"[migration] post-swap failed: {e}")
 

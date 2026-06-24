@@ -1,25 +1,26 @@
 """
 ========================================
-server.py — MCP 服务入口 + Dashboard HTTP 路由 + 启动装配
+server.py — MCP 服务入口 + 启动装配
 ========================================
 
 启动整个 Ombre Brain 进程：加载配置、创建 BucketManager / Dehydrator /
-DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime，
-然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
+DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime 与
+web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
 - 启动后暴露 12 个 MCP 工具：breath/hold/grow/trace/anchor/release/
   pulse/plan/letter_write/letter_read/dream/I；每个入口 ≤ 10 行，只负责转发
-- 同时开 Dashboard HTTP 服务：@mcp.custom_route() 下的路由都留在本文件
-- 提供会话 / 鉴权 / Webhook / SSE 推送 / 压力表 / heartbeat 等走 HTTP 的能力
-- 企业级细节：CSRF token / rate limit / nonce 去重 / TLS 提示
+- Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
+  本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
+- 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
+  MCP Bearer 鉴权中间件、双连接器（/mcp + /mcp-extra）合并、uvicorn 拉起
 
 不做什么（边界）：
 - 不在这里写 hold/breath/dream 等业务逻辑（全在 tools/* 下）
-- 不写 LLM prompt（dehydrator 负责）
+- 不写 HTTP 路由处理（全在 web/* 下）；不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp/mcp_extra 两个实例 + 12 个 @mcp*.tool() 函数 + 一批 @mcp.custom_route HTTP 接口
+对外暴露：mcp/mcp_extra 两个实例 + 12 个 @mcp*.tool() 函数；HTTP 路由在 src/web/*
 ========================================
 """
 
@@ -138,15 +139,7 @@ except ValueError:
 _WEBHOOK_TIMEOUT_SECONDS = 5.0
 _HEALTH_PROBE_TIMEOUT_SECONDS = 5
 
-# --- Dashboard 鉴权常量 / 会话 / 密码逻辑已移至 web/_shared.py ---
-
-# --- /api/logs 返回行数限制 ---
-_LOGS_DEFAULT_LIMIT = 200
-_LOGS_MAX_LIMIT = 2000
-
-# --- /api/errors/recent 返回条数限制 ---
-_ERRORS_DEFAULT_LIMIT = 50
-_ERRORS_MAX_LIMIT = 500
+# --- Dashboard 鉴权 / 会话 / 密码 / 日志&错误面板分页常量 已移至 web/_shared.py、web/system.py ---
 
 
 async def _fire_webhook(event: str, payload: dict) -> None:
@@ -347,19 +340,12 @@ _wsh.init_runtime(
     github_sync_instance=github_sync_instance,
     restart_github_auto_task=_restart_github_auto_task,
 )
-from web._shared import (  # noqa: F401  (re-export for not-yet-migrated routes below)
-    _sessions,
-    _is_authenticated, _is_setup_needed, _verify_any_password,
-    _create_session, _set_session_cookie, _is_https_request,
-    _load_auth_data, _load_password_hash, _save_password_hash,
-    _save_security_qa, _verify_security_answer, _verify_password_hash,
-    _load_sessions, _save_sessions, _require_auth,
-)
-
-# 启动时把磁盘上的会话装回内存（容器重启不踢登录）
+# 启动时把磁盘上的会话装回内存（容器重启不踢登录）。鉴权/会话逻辑全在 web/_shared.py，
+# server.py 自身已无 @mcp.custom_route 路由，只需启动时载入一次会话。
+from web._shared import _load_sessions
 _load_sessions()
 
-# 注册已迁移到 web/ 的路由（目前：/auth/*）
+# 注册所有 web/ 路由模块（HTTP 层已全部迁出，见 web/__init__.register_all）
 _web.register_all(mcp)
 
 
@@ -803,19 +789,6 @@ async def dream(window_hours: Optional[int] = 48) -> str:
 # =============================================================
 
 
-# =============================================================
-# /api/host-vault — read/write the host-side OMBRE_HOST_VAULT_DIR
-# 用于在 Dashboard 设置 docker-compose 挂载的宿主机记忆桶目录。
-# 写入项目根目录的 .env 文件，需 docker compose down/up 才能生效。
-# =============================================================
-
-# .env 读写 helper 已移到 web/_shared.py（config/host-vault 共用）；import 回来供本文件仍未迁移的路由使用。
-from web._shared import _project_env_path, _read_env_var, _write_env_var  # noqa: F401
-
-
-# =============================================================
-# /api/github/* —— 已拆分到 web/github.py
-# =============================================================
 
 
 # =============================================================

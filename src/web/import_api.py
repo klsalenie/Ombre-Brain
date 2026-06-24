@@ -370,7 +370,7 @@ def register(mcp) -> None:
     # =============================================================
     # /api/export  — 完整记忆打包导出
     # 导出内容：所有 bucket markdown + embeddings.db + export_meta.json（含 embedding 模型信息）
-    # 不导出 sh.config（避免 api_key 等密钥泄露）
+    # 不导出 config（避免 api_key 等密钥泄露）
     # export_meta.json 中的 embedding 字段供导入端检查模型一致性。
     # =============================================================
     @mcp.custom_route("/api/export", methods=["GET"])
@@ -412,7 +412,7 @@ def register(mcp) -> None:
                         logger.warning(f"export: skip embeddings.db: {e}")
 
                 # 3) export_meta.json — 包含 embedding 模型信息，供导入端检查模型一致性
-                # 不包含 sh.config（避免泄露 api_key 等密钥）
+                # 不包含 config（避免泄露 api_key 等密钥）
                 try:
                     from datetime import datetime as _dt
                     _emb_backend = getattr(sh.embedding_engine, "_backend", None)
