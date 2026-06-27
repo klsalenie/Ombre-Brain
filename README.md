@@ -343,61 +343,7 @@ cd Ombre-Brain
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-<<<<<<< HEAD
-**第二步：创建 `.env` 文件**
-
-在项目目录下新建一个叫 `.env` 的文件（注意有个点），内容填：
-
-```
-OMBRE_API_KEY=你的API密钥
-```
-
-> **🔑 推荐免费方案：Google AI Studio**
-> 1. 打开 [aistudio.google.com/apikey](https://aistudio.google.com/apikey)，登录 Google 账号
-> 2. 点击「Create API key」生成一个 key
-> 3. 把 key 填入 `.env` 文件的 `OMBRE_API_KEY=` 后面
-> 4. 免费额度（请以官网实时信息为准）：
->    - **脱水/打标模型**（`gemini-2.5-flash-lite`）：免费层 30 req/min
->    - **向量化模型**（`gemini-embedding-001`）：免费层 1500 req/day，3072 维
-> 5. 在 `config.yaml` 中 `dehydration.base_url` 设为 `https://generativelanguage.googleapis.com/v1beta/openai`
->
-> 也支持 DeepSeek、Ollama、LM Studio、vLLM 等任意 OpenAI 兼容 API。
->
-> **Recommended free option: Google AI Studio**
-> 1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey) and create an API key
-> 2. Free tier (as of 2025, check official site for current limits):
->    - Dehydration model (`gemini-2.5-flash-lite`): 30 req/min free
->    - Embedding model (`gemini-embedding-001`): 1500 req/day free, 3072 dims
-> 3. Set `dehydration.base_url` to `https://generativelanguage.googleapis.com/v1beta/openai` in `config.yaml`
-> Also supports DeepSeek, Ollama, LM Studio, vLLM, or any OpenAI-compatible API.
-
-没有 API key 则脱水压缩和自动打标功能不可用（会报错），但记忆的读写和检索仍正常工作。如果暂时不用脱水功能，可以留空：
-
-```
-OMBRE_API_KEY=
-```
-
-**第三步：配置 `docker-compose.yml`（指向你的 Obsidian Vault）**
-
-用文本编辑器打开 `docker-compose.yml`，找到这一行：
-
-```yaml
-- ./buckets:/data
-```
-
-改成你的 Obsidian Vault 里 `Ombre Brain` 文件夹的路径，例如：
-
-```yaml
-- /Users/你的用户名/Documents/Obsidian Vault/Ombre Brain:/data
-```
-
-> 不知道路径？在 Obsidian 里右键那个文件夹 → 「在访达中显示」，然后把地址栏的路径复制过来。
-> 不想挂载 Obsidian 也行，保持 `./buckets:/data` 不动，数据会存在项目目录的 `buckets/` 文件夹里。
-
-**第四步：启动**
-=======
 验证：
->>>>>>> upstream/main
 
 ```bash
 docker logs ombre-brain   # 看到 "Uvicorn running on http://0.0.0.0:8000"
@@ -424,244 +370,7 @@ python src/server.py
 
 ---
 
-<<<<<<< HEAD
-```bash
-export OMBRE_API_KEY="your-api-key"
-```
-
-支持任何 OpenAI 兼容 API。在 `config.yaml` 里改 `base_url` 和 `model` 就行。
-Supports any OpenAI-compatible API. Just change `base_url` and `model` in `config.yaml`.
-
-> **💡 向量化检索（Embedding）**
-> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。每次 `hold`/`grow` 存入记忆时自动生成 embedding 并存入 `embeddings.db`（SQLite）。
-> 推荐：**Google AI Studio 的 `gemini-embedding-001`**（免费，1500 次/天，3072 维向量）。在 `config.yaml` 的 `embedding` 部分配置。
-> 不配置 embedding 也能用，系统会降级到纯 fuzzy matching 模式。
->
-> **已有存量桶需要补生成 embedding**：运行 `backfill_embeddings.py`：
-> ```bash
-> OMBRE_API_KEY="your-key" python backfill_embeddings.py --batch-size 20
-> ```
-> Docker 用户：`docker exec -e OMBRE_BUCKETS_DIR=/data ombre-brain python3 backfill_embeddings.py --batch-size 20`
->
-> **Embedding support**: Built-in dual-channel search: keyword + vector semantic. Embeddings are auto-generated on each `hold`/`grow` and stored in `embeddings.db` (SQLite). Recommended: **Google AI Studio `gemini-embedding-001`** (free, 1500 req/day, 3072-dim). Configure in `config.yaml` under `embedding`. Without it, falls back to fuzzy matching. For existing buckets, run `backfill_embeddings.py`.
-
-### 接入 Claude Desktop / Connect to Claude Desktop
-
-在 Claude Desktop 配置文件中添加（macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`）：
-
-Add to your Claude Desktop config:
-
-```json
-{
-  "mcpServers": {
-    "ombre-brain": {
-      "command": "python",
-      "args": ["/path/to/Ombre-Brain/server.py"],
-      "env": {
-        "OMBRE_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-### 接入 Claude.ai (远程) / Connect to Claude.ai (remote)
-
-需要 HTTP 传输 + 隧道。可以用 Docker：
-Requires HTTP transport + tunnel. Docker setup:
-
-```bash
-echo "OMBRE_API_KEY=your-api-key" > .env
-docker-compose up -d
-```
-
-`docker-compose.yml` 里配好了 Cloudflare Tunnel。你需要自己在 `~/.cloudflared/` 下放凭证和路由配置。
-The `docker-compose.yml` includes Cloudflare Tunnel. You'll need your own credentials under `~/.cloudflared/`.
-
-### 指向 Obsidian / Point to Obsidian
-
-在 `config.yaml` 里设置 `buckets_dir`：
-Set `buckets_dir` in `config.yaml`:
-
-```yaml
-buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
-```
-
-不设的话，默认用项目目录下的 `buckets/`。
-If not set, defaults to `buckets/` in the project directory.
-
-## 配置 / Configuration
-
-所有参数在 `config.yaml`（从 `config.example.yaml` 复制）。关键的几个：
-All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
-
-| 参数 Parameter | 说明 Description | 默认 Default |
-|---|---|---|
-| `transport` | `stdio`（本地）/ `streamable-http`（远程）| `stdio` |
-| `buckets_dir` | 记忆桶存储路径 / Bucket storage path | `./buckets/` |
-| `dehydration.model` | 脱水用的 LLM 模型 / LLM model for dehydration | `deepseek-chat` |
-| `dehydration.base_url` | API 地址 / API endpoint | `https://api.deepseek.com/v1` |
-| `embedding.enabled` | 启用向量语义检索 / Enable embedding search | `true` |
-| `embedding.model` | Embedding 模型 / Embedding model | `gemini-embedding-001` |
-| `decay.lambda` | 衰减速率，越大越快忘 / Decay rate | `0.05` |
-| `decay.threshold` | 归档阈值 / Archive threshold | `0.3` |
-| `merge_threshold` | 合并相似度阈值 (0-100) / Merge similarity | `75` |
-
-敏感配置用环境变量：
-Sensitive config via env vars:
-- `OMBRE_API_KEY` — LLM API 密钥
-- `OMBRE_TRANSPORT` — 覆盖传输方式
-- `OMBRE_BUCKETS_DIR` — 覆盖存储路径
-- `OMBRE_DASHBOARD_PASSWORD` — Dashboard 访问密码（可选，见下）
-
-## Dashboard 认证 / Dashboard Auth
-
-自 v1.3.0 起，Dashboard 和所有 `/api/*` 端点均受密码保护。
-Since v1.3.0, the Dashboard and all `/api/*` endpoints are password-protected.
-
-**首次访问**：若未设置密码，浏览器会弹出设置向导，填写并确认密码后即可使用。
-**First visit**: If no password is set, a setup wizard will appear. Enter and confirm a password to get started.
-
-**通过环境变量预设密码**：在 `docker-compose.user.yml` 中添加：
-**Pre-set via env var** in your `docker-compose.user.yml`:
-```yaml
-environment:
-  - OMBRE_DASHBOARD_PASSWORD=your_password_here
-```
-设置后，Dashboard 的"修改密码"功能将被禁用，必须通过环境变量修改。
-When set, the in-Dashboard password change is disabled — modify the env var directly.
-
-完整环境变量说明见 [ENV_VARS.md](ENV_VARS.md)。
-Full env var reference: [ENV_VARS.md](ENV_VARS.md).
-
-## 衰减公式 / Decay Formula
-
-$$final\_score = Importance \times activation\_count^{0.3} \times e^{-\lambda \times days} \times combined\_weight \times resolved\_factor \times urgency\_boost$$
-
-### 短期/长期权重分离 / Short-term vs Long-term Weight Separation
-
-系统对记忆的权重计算采用**分段策略**，模拟人类记忆的时效特征：
-The system uses a **segmented weighting strategy** that mimics how human memory prioritizes:
-
-| 阶段 Phase | 时间范围 | 权重分配 | 直觉解释 |
-|---|---|---|---|
-| 短期 Short-term | ≤ 3 天 | 时间 70% + 情感 30% | 刚发生的事，鲜活度最重要 |
-| 长期 Long-term | > 3 天 | 情感 70% + 时间 30% | 时间淡了，情感强度决定能记多久 |
-
-$$combined\_weight = \begin{cases} time\_weight \times 0.7 + emotion\_weight \times 0.3 & \text{if } days \leq 3 \\ emotion\_weight \times 0.7 + time\_weight \times 0.3 & \text{if } days > 3 \end{cases}$$
-
-### 时间系数（新鲜度加成）/ Time Weight (Freshness Bonus)
-
-连续指数衰减，无跳变：
-Continuous exponential decay, no discontinuities:
-
-$$freshness = 1.0 + 1.0 \times e^{-t/36}$$
-
-| 距存入时间 Time since creation | 新鲜度乘数 Multiplier |
-|---|---|
-| 刚存入 (t=0) | ×2.0 |
-| 约 25 小时 | ×1.5 |
-| 约 50 小时 | ×1.25 |
-| 72 小时 (3天) | ×1.14 |
-| 1 周+ | ≈ ×1.0 |
-
-t 为小时，36 为衰减常数。老记忆不被惩罚（下限 ×1.0），新记忆获得额外加成。
-
-### 情感权重 / Emotion Weight
-
-$$emotion\_weight = base + arousal \times arousal\_boost$$
-
-- 默认 `base=1.0`, `arousal_boost=0.8`
-- arousal=0.3（平静）→ 1.24；arousal=0.9（激动）→ 1.72
-
-### 权重池修正因子 / Weight Pool Modifiers
-
-| 状态 State | 修正因子 Factor | 说明 |
-|---|---|---|
-| 未解决 Unresolved | ×1.0 | 正常权重 |
-| 已解决 Resolved | ×0.05 | 沉底，等关键词唤醒 |
-| 已解决+已消化 Resolved+Digested | ×0.02 | 加速淡化，归档为无限小 |
-| 高唤醒+未解决 Urgent | ×1.5 | arousal>0.7 的未解决记忆额外加权 |
-| 钉选 Pinned | 999.0 | 不衰减、不合并、importance=10 |
-| Feel | 50.0 | 固定分数，不参与衰减 |
-
-### 参数说明 / Parameters
-
-- `importance`: 1-10，记忆重要性 / memory importance
-- `activation_count`: 被检索的次数，越常被想起衰减越慢 / retrieval count; more recalls = slower decay
-- `days`: 距上次激活的天数 / days since last activation
-- `arousal`: 唤醒度，越强烈的记忆越难忘 / arousal; intense memories are harder to forget
-- `λ` (decay_lambda): 衰减速率，默认 0.05 / decay rate, default 0.05
-
-## Dreaming 与 Feel / Dreaming & Feel
-
-### Dreaming — 做梦
-每次新对话开始时，Claude 会自动执行 `dream()`——读取最近的记忆桶，用第一人称思考：哪些事还有重量？哪些可以放下了？
-
-At the start of each conversation, Claude runs `dream()` — reads recent memory buckets and reflects in first person: what still carries weight? What can be let go?
-
-- 值得放下的 → `trace(resolved=1)` 让它沉底
-- 有沉淀的 → 写 `feel`，记录模型自己的感受
-- 没有沉淀就不写，不强迫产出
-
-### Feel — 带走的东西
-Feel 不是事件记录，是**模型带走的东西**——一句感受、一个未解答的问题、一个观察到的变化。
-
-Feel is not an event log — it's **what the model carries away**: a feeling, an unanswered question, a noticed change.
-
-- `hold(content="...", feel=True, source_bucket="源记忆ID", valence=模型自己的感受)`
-- `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
-- `source_bucket` 指向被消化的记忆，会被标记为「已消化」→ 加速淡化到无限小，但不会被删除
-- Feel 不参与普通浮现、不衰减、不参与 dreaming
-- 用 `breath(domain="feel")` 读取之前的 feel
-
-### 对话启动完整流程 / Conversation Start Sequence
-```
-1. breath()              — 睁眼，看有什么浮上来
-2. dream()               — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel") — 读之前的 feel
-4. 开始和用户说话
-```
-
-## 给 Claude 的使用指南 / Usage Guide for Claude
-
-`CLAUDE_PROMPT.md` 是写给 Claude 看的使用说明。放到你的 system prompt 或 custom instructions 里就行。
-
-`CLAUDE_PROMPT.md` is the usage guide written for Claude. Put it in your system prompt or custom instructions.
-
-## 工具脚本 / Utility Scripts
-
-| 脚本 Script | 用途 Purpose |
-|---|---|
-| `embedding_engine.py` | 向量化引擎，管理 embedding 的生成、存储、相似度搜索 / Embedding engine: generate, store, and search embeddings |
-| `backfill_embeddings.py` | 为存量桶批量生成 embedding / Batch-generate embeddings for existing buckets |
-| `write_memory.py` | 手动写入记忆，绕过 MCP / Manually write memories, bypass MCP |
-| `migrate_to_domains.py` | 迁移平铺文件到域子目录 / Migrate flat files to domain subdirs |
-| `reclassify_domains.py` | 基于关键词重分类 / Reclassify by keywords |
-| `reclassify_api.py` | 用 API 重打标未分类桶 / Re-tag uncategorized buckets via API |
-| `test_tools.py` | MCP 工具集成测试（8 项） / MCP tool integration tests (8 tests) |
-| `test_smoke.py` | 冒烟测试 / Smoke test |
-
-## 部署 / Deploy
-
-### Docker Hub 预构建镜像
-
-[![Docker Hub](https://img.shields.io/docker/v/p0luz/ombre-brain?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/p0luz/ombre-brain)
-
-不用 clone 代码、不用 build，直接拉取预构建镜像：
-
-```bash
-docker pull p0luz/ombre-brain:latest
-curl -O https://raw.githubusercontent.com/P0luz/Ombre-Brain/main/docker-compose.user.yml
-echo "OMBRE_API_KEY=你的key" > .env
-docker compose -f docker-compose.user.yml up -d
-```
-
-验证：`curl http://localhost:8000/health`
-Dashboard：浏览器打开 `http://localhost:8000/dashboard`
-=======
 ## 部署到云平台 / Deploy to Cloud Platforms
->>>>>>> upstream/main
 
 ### Render
 
@@ -669,21 +378,6 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 
 > ⚠️ **免费层不可用**：Render 免费层无持久化磁盘，重启后记忆会丢失，且无流量时会休眠。**必须使用 Starter（$7/mo）或以上**。
 
-<<<<<<< HEAD
-项目根目录已包含 `render.yaml`，点击按钮后：
-1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
-2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
-3. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
-4. Dashboard：`https://<你的服务名>.onrender.com/dashboard`
-5. 部署后 MCP URL：`https://<你的服务名>.onrender.com/mcp`
-
-`render.yaml` is included. After clicking the button:
-1. `OMBRE_API_KEY`: any OpenAI-compatible key (**required** for hold/grow; without it those tools raise an error)
-2. (Optional) `OMBRE_BASE_URL`: any OpenAI-compatible endpoint, e.g. `https://api.deepseek.com/v1`, `http://123.1.1.1:7689/v1`, `http://your-ollama:11434/v1`
-3. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
-4. Dashboard: `https://<your-service>.onrender.com/dashboard`
-5. MCP URL after deploy: `https://<your-service>.onrender.com/mcp`
-=======
 仓库已包含 `render.yaml`。点按钮后：
 
 1. 设置环境变量 `OMBRE_COMPRESS_API_KEY`（必需）
@@ -692,7 +386,6 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 4. 部署后 Dashboard：`https://<服务名>.onrender.com`，MCP URL：`https://<服务名>.onrender.com/mcp`
 
 Render 自带 HTTPS，可直接在 Claude.ai 添加，无需额外 Tunnel。
->>>>>>> upstream/main
 
 ### Zeabur
 
@@ -705,11 +398,6 @@ Render 自带 HTTPS，可直接在 Claude.ai 添加，无需额外 Tunnel。
 
 ### 自有 VPS
 
-<<<<<<< HEAD
-2. **设置环境变量 / Set environment variables**（服务页面 → **Variables** 标签页）
-   - `OMBRE_API_KEY`（**必需**）— LLM API 密钥；未设置时 hold/grow/dream 会报错
-   - `OMBRE_BASE_URL`（可选）— API 地址，如 `https://api.deepseek.com/v1`
-=======
 ```bash
 git clone https://github.com/P0luz/Ombre-Brain.git
 cd Ombre-Brain
@@ -717,7 +405,6 @@ cp config.example.yaml config.yaml
 # 修改 config.yaml 设置 API key 和其他参数
 docker compose -f deploy/docker-compose.yml up -d
 ```
->>>>>>> upstream/main
 
 配合 nginx / Caddy 反代到 443 端口，或直接用 Dashboard 内置的 Cloudflare Tunnel 管理器。
 
@@ -879,51 +566,6 @@ docker compose -f deploy/docker-compose.yml up -d
 - **热更新按钮看部署方式**：Docker（有 restart 策略）点完自动恢复；裸机/纯 Python 需要 systemd/pm2 等守护，否则更新后要手动重启。点之前先「导出记忆备份」。
 - **自有前端 / GPT / GLM 接入**：默认强制 OAuth，会卡住非 Claude 客户端；设 `OMBRE_MCP_REQUIRE_AUTH=false` 关掉（注意别裸奔公网）。
 - **首次访问先设密码**：设完之后所有 `/api/*` 都要登录；忘了密码可用设置里的安全问题急救。
-
----
-
-## 测试 / Testing
-
-测试套件覆盖规格书所有场景（场景 01–11），以及 B-01 至 B-10 全部 bug 修复的回归测试。
-
-The test suite covers all spec scenarios (01–11) and regression tests for every bug fix (B-01 to B-10).
-
-### 快速运行 / Quick Start
-
-```bash
-pip install pytest pytest-asyncio
-pytest tests/                          # 全部测试
-pytest tests/unit/                     # 单元测试
-pytest tests/integration/             # 集成测试（场景全流程）
-pytest tests/regression/              # 回归测试（B-01..B-10）
-pytest tests/ -k "B01"               # 单个回归测试
-pytest tests/ -v                       # 详细输出
-```
-
-### 测试层级 / Test Layers
-
-| 目录 Directory | 内容 Contents |
-|---|---|
-| `tests/unit/` | 单独测试 calculate_score、topic_score、时间得分、CRUD 等核心函数 |
-| `tests/integration/` | 场景全流程：冷启动、hold、search、trace、decay、feel 等 11 个场景 |
-| `tests/regression/` | 每个 bug（B-01 至 B-10）独立回归测试，含边界条件 |
-
-### 回归测试覆盖 / Regression Coverage
-
-| 文件 | Bug | 核心断言 |
-|---|---|---|
-| `test_issue_B01.py` | resolved 桶不再自动归档 | `update(resolved=True)` 后桶留在 `dynamic/`，搜索仍可命中，得分 ×0.05 |
-| `test_issue_B03.py` | float activation_count 不被 int() 截断 | 1.3 > 1.0 得分，`_time_ripple` 写入 0.3 增量 |
-| `test_issue_B04.py` | create() 初始 activation_count=0 | 新建桶满足冷启动条件，touch() 后变 1 |
-| `test_issue_B05.py` | 时间衰减系数 0.02（原 0.1）| 30天 ≈ 0.549，非旧值 0.049 |
-| `test_issue_B06.py` | w_time 默认 1.5（原 2.5）| `BucketManager.w_time == 1.5` |
-| `test_issue_B07.py` | content_weight 默认 1.0（原 3.0）| 名字完全匹配得分 > 内容模糊匹配 |
-| `test_issue_B08.py` | auto_resolve 同轮应用降权因子 | stale meta 修复后 score ×0.05 立即生效 |
-| `test_issue_B09.py` | hold() 保留用户传入的 valence/arousal | 用户值优先于 analyze() 结果 |
-| `test_issue_B10.py` | feel 桶 domain=[] 不被填充 | feel 桶保持 `[]`；dynamic 桶正确填 `["未分类"]` |
-
-> **测试隔离**：所有测试运行在 `tmp_path` 临时目录，绝不触碰真实记忆数据。
-> **Test isolation**: All tests run in `tmp_path` — your real memory data is never touched.
 
 ---
 
