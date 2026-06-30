@@ -1,52 +1,37 @@
 #!/usr/bin/env python3
 """
-Demote stale "permanent" buckets back to dynamic/ — one-time repair.
-一次性修复：把「已取消钉选但仍卡在 permanent/」的桶降级回 dynamic/。
+Audit unpinned permanent buckets.
 
-背景 / Why
-----------
-v2.3.x 之前 trace(bucket_id, pinned=0) 只翻 pinned 标记，却没有把桶移出
-permanent/、也没把 type 改回 dynamic。后果：
-  * calculate_score 仍走 type=="permanent" 分支 → 权重恒 999、永不衰减
-  * count_pinned 仍把它算进固化配额 → pulse 固化数虚高、钉不了新桶
+type=permanent is now a first-class bucket type. A permanent bucket does not
+need pinned=True to be valid, visible, or readable by breath. For safety this
+script is read-only by default.
 
-bucket_manager.update() 现已对称地在 unpin 时自动降级，但存量「幽灵固化桶」
-（pinned != True 却还在 permanent/）需要这个脚本一次性清理。
-
-判定 / Criteria
----------------
-permanent/ 目录下、metadata.pinned 不为 True 且 protected 不为 True 的桶
-即为幽灵桶，降级为 type=dynamic 并移动到 dynamic/<域>/。
-
-Usage
------
-    OMBRE_BUCKETS_DIR=/data python tools/fix_unpinned_permanent.py [--dry-run]
-
-默认 --dry-run=False 直接执行；先跑 --dry-run 看清单更稳。
+Use --force-demote only when you have manually confirmed that the listed files
+are legacy buckets that should be moved back to dynamic/.
 """
 
-import asyncio
 import argparse
+import asyncio
 import os
 import sys
 
 import frontmatter
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from utils import load_config            # noqa: E402
+from utils import load_config             # noqa: E402
 from bucket_manager import BucketManager  # noqa: E402
 
 
-async def fix(dry_run: bool) -> None:
+async def audit(force_demote: bool) -> None:
     config = load_config()
     mgr = BucketManager(config)
 
     perm_dir = mgr.permanent_dir
     if not os.path.exists(perm_dir):
-        print(f"permanent/ 不存在：{perm_dir}")
+        print(f"permanent/ does not exist: {perm_dir}")
         return
 
-    ghosts = []
+    candidates = []
     for root, _, files in os.walk(perm_dir):
         for fname in files:
             if not fname.endswith(".md"):
@@ -55,46 +40,51 @@ async def fix(dry_run: bool) -> None:
             try:
                 post = frontmatter.load(fpath)
             except Exception as e:
-                print(f"⚠️ 跳过无法解析的桶 {fpath}: {e}")
+                print(f"skip unreadable bucket {fpath}: {e}")
                 continue
             meta = post.metadata
             pinned = bool(meta.get("pinned"))
             protected = bool(meta.get("protected"))
-            if not pinned and not protected:
-                ghosts.append((fpath, post))
+            if meta.get("type") == "permanent" and not pinned and not protected:
+                candidates.append((fpath, post))
 
-    print(f"permanent/ 扫描完成：发现 {len(ghosts)} 个已取消钉选但仍卡在固化区的幽灵桶。")
-    for fpath, post in ghosts:
+    print(
+        "permanent/ scan complete: "
+        f"{len(candidates)} explicit permanent buckets without pinned/protected."
+    )
+    if candidates:
+        print("These are valid permanent buckets in the current data model:")
+    for fpath, post in candidates:
         bid = post.metadata.get("id") or os.path.splitext(os.path.basename(fpath))[0]
         name = post.metadata.get("name") or ""
-        print(f"  - {bid} 《{name}》  ({fpath})")
+        print(f"  - {bid} {name} ({fpath})")
 
-    if dry_run:
-        print("\n[dry-run] 未做任何改动。去掉 --dry-run 执行降级。")
-        return
-    if not ghosts:
+    if not force_demote:
+        print("\nNo changes made. Pass --force-demote only for manually verified legacy data.")
         return
 
     moved = 0
-    for fpath, post in ghosts:
+    for fpath, post in candidates:
         domain = post.metadata.get("domain") or ["未分类"]
         post.metadata["type"] = "dynamic"
+        post.metadata["pinned"] = False
         try:
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
             mgr._move_bucket(fpath, mgr.dynamic_dir, domain)
             moved += 1
         except OSError as e:
-            print(f"⚠️ 降级失败 {fpath}: {e}")
+            print(f"demote failed {fpath}: {e}")
 
-    print(f"\n✅ 已降级 {moved} 个幽灵桶到 dynamic/。现在 pulse 的固化数应与实际 pinned 数一致。")
+    print(f"\nDemoted {moved} manually confirmed buckets to dynamic/.")
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="只打印将被降级的桶，不改动")
+    ap.add_argument("--dry-run", action="store_true", help="accepted for compatibility; no changes are made")
+    ap.add_argument("--force-demote", action="store_true", help="explicitly move listed buckets to dynamic/")
     args = ap.parse_args()
-    asyncio.run(fix(args.dry_run))
+    asyncio.run(audit(force_demote=args.force_demote))
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
 #     -e OMBRE_COMPRESS_API_KEY=your-llm-key \
 #     -e OMBRE_EMBED_API_KEY=your-gemini-key \
 #     -e OMBRE_DASHBOARD_PASSWORD=xxx \
-#     -p 8000:8000 ombre-brain
+#     -p 18001:8000 ombre-brain          # 对外 18001 → 容器内 8000
 # 推荐用 deploy/docker-compose.yml（开发）或 deploy/docker-compose.user.yml（用户）启动。
 # ============================================================
 
@@ -48,6 +48,9 @@ VOLUME ["/app/buckets"]
 # Default to streamable-http for container (remote access)
 # 容器场景默认用 streamable-http
 ENV OMBRE_TRANSPORT=streamable-http
+# 容器内固定监听 8000；对外通过 host 端口映射 18001:8000 暴露（保持 Cloudflare
+# ingress 指向 :8000 不变）。裸机（非容器）不读此 ENV，走 server.py 默认 18001。
+ENV OMBRE_PORT=8000
 ENV OMBRE_BUCKETS_DIR=/app/buckets
 # config 默认落在持久卷 /app/buckets 里，而不是镜像可写层 /app/config.yaml。
 # 关键：很多 PaaS（Zeabur / 部分 Render 配置等）用**只读根文件系统**，只有挂载的卷可写——

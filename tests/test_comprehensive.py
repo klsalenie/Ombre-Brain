@@ -297,16 +297,13 @@ class TestBucketManagerCreate:
         assert await count_pinned() == 0
 
     @pytest.mark.asyncio
-    async def test_decay_cycle_self_heals_orphan_permanent(self, bucket_mgr, decay_eng):
-        """孤儿固化桶（type==permanent 却 pinned=False）应在衰减周期被自动降级回 dynamic。
-
-        模拟历史脏数据：早期 unpin 只翻 pinned 标记、没降级 type，桶留在 permanent/。
-        这类桶 calculate_score 恒返 999、永不衰减、前端面板够不着。后台衰减循环应自愈。"""
+    async def test_decay_cycle_preserves_unpinned_permanent(self, bucket_mgr, decay_eng):
+        """type=permanent is a first-class bucket type, even without pinned=True."""
         import frontmatter as fm
 
         bid = await bucket_mgr.create(content="一条曾被钉选的准则")
         await bucket_mgr.update(bid, pinned=True)
-        # 手动制造孤儿：直接把 pinned 翻回 False，但保留 type=permanent、文件仍在 permanent/
+        # Simulate stored permanent content that has no pinned flag.
         fpath = bucket_mgr._find_bucket_file(bid)
         post = fm.load(fpath)
         post["pinned"] = False
@@ -315,15 +312,15 @@ class TestBucketManagerCreate:
 
         orphan = await bucket_mgr.get(bid)
         assert orphan["metadata"]["type"] == "permanent"
-        assert decay_eng.calculate_score(orphan["metadata"]) == 999.0  # 卡死的权重
+        assert decay_eng.calculate_score(orphan["metadata"]) == 999.0
 
-        # 跑一轮衰减 → 应自愈降级
-        await decay_eng.run_decay_cycle()
+        stats = await decay_eng.run_decay_cycle()
 
         healed = await bucket_mgr.get(bid)
-        assert healed["metadata"]["type"] == "dynamic"
+        assert stats["demoted_orphans"] == 0
+        assert healed["metadata"]["type"] == "permanent"
         assert healed["metadata"].get("pinned") is False
-        assert decay_eng.calculate_score(healed["metadata"]) != 999.0
+        assert decay_eng.calculate_score(healed["metadata"]) == 999.0
 
     @pytest.mark.asyncio
     async def test_importance_clamped_below_1(self, bucket_mgr):

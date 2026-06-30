@@ -62,4 +62,73 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 echo "[entrypoint] config ready at '$CONFIG'."
+
+# ============================================================
+# 持久化代码 bootstrap（#4a ①②）
+# ------------------------------------------------------------
+# 问题：容器平台(Docker/Render/Zeabur)代码烤在镜像只读层，/api/do-update 的
+# 热更新写在可写临时层，容器一重建就回退到旧镜像 → 更新"留不住"。
+# 方案：把 src/frontend 播种到数据卷上的 CODE_DIR，从那里运行；repo_root 随之
+# 指向 CODE_DIR，热更新直接写持久盘，容器重建也还在。
+#   · 镜像版本变化(正经重建) → 重新播种，让重建覆盖旧热更新。
+#   · 连续启动失败 → 回滚到 _prev（do-update 覆盖前留的上一版），防坏更新锁死。
+#   · 任何环节失败 → 回退到镜像内置 /app/src，绝不 brick。
+# 裸机(非 Docker)不走本脚本，直接从仓库目录跑，本就是持久的。
+# ============================================================
+IMAGE_ROOT=/app
+CODE_DIR="${OMBRE_CODE_DIR:-$(dirname "$CONFIG")/_app}"
+RUN_ROOT="$IMAGE_ROOT"
+ROLLBACK_THRESHOLD=2
+
+_bootstrap_code() {
+    # CODE_DIR 必须在可写持久卷上；试探写权限，失败就回退镜像代码。
+    mkdir -p "$CODE_DIR" 2>/dev/null || return 1
+    ( : > "$CODE_DIR/.wtest" ) 2>/dev/null || return 1
+    rm -f "$CODE_DIR/.wtest" 2>/dev/null || true
+
+    IMG_VER="$(cat "$IMAGE_ROOT/VERSION" 2>/dev/null || echo unknown)"
+    SEEDED_VER="$(cat "$CODE_DIR/.seeded_image_version" 2>/dev/null || echo none)"
+
+    # --- ② 崩溃自愈：上一次启动没被 server.py 标记成功 → 计数累加；超阈值且有 _prev 则回滚 ---
+    FAILS="$(cat "$CODE_DIR/.boot_fails" 2>/dev/null || echo 0)"
+    case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+    if [ "$FAILS" -ge "$ROLLBACK_THRESHOLD" ] && [ -f "$CODE_DIR/_prev/src/server.py" ]; then
+        echo "[entrypoint] 连续 $FAILS 次启动失败 → 回滚到上一版代码 (_prev)"
+        rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null
+        cp -a "$CODE_DIR/_prev/src" "$CODE_DIR/src" 2>/dev/null || return 1
+        cp -a "$CODE_DIR/_prev/frontend" "$CODE_DIR/frontend" 2>/dev/null || true
+        [ -f "$CODE_DIR/_prev/VERSION" ] && cp -a "$CODE_DIR/_prev/VERSION" "$CODE_DIR/VERSION" 2>/dev/null
+        rm -rf "$CODE_DIR/_prev" 2>/dev/null
+        FAILS=0
+        echo 0 > "$CODE_DIR/.boot_fails" 2>/dev/null || true
+    fi
+
+    # --- ① 播种 / 重建覆盖：首次，或镜像版本变了(正经重建) ---
+    if [ ! -f "$CODE_DIR/src/server.py" ] || [ "$IMG_VER" != "$SEEDED_VER" ]; then
+        echo "[entrypoint] 播种代码到持久卷 $CODE_DIR (image=v$IMG_VER, 卷上 seeded=$SEEDED_VER)"
+        rm -rf "$CODE_DIR/src" "$CODE_DIR/frontend" 2>/dev/null
+        cp -a "$IMAGE_ROOT/src" "$CODE_DIR/src" 2>/dev/null || return 1
+        cp -a "$IMAGE_ROOT/frontend" "$CODE_DIR/frontend" 2>/dev/null || return 1
+        cp -a "$IMAGE_ROOT/VERSION" "$CODE_DIR/VERSION" 2>/dev/null || true
+        rm -rf "$CODE_DIR/_prev" 2>/dev/null
+        echo "$IMG_VER" > "$CODE_DIR/.seeded_image_version" 2>/dev/null || true
+        FAILS=0
+    fi
+
+    [ -f "$CODE_DIR/src/server.py" ] || return 1
+
+    # 预增启动失败计数；启动成功后 server.py 会清零，崩溃则保留 → 下次累加直至回滚。
+    echo $((FAILS + 1)) > "$CODE_DIR/.boot_fails" 2>/dev/null || true
+    RUN_ROOT="$CODE_DIR"
+    return 0
+}
+
+if _bootstrap_code; then
+    echo "[entrypoint] 从持久卷运行: $RUN_ROOT/src/server.py"
+else
+    echo "[entrypoint] 持久卷代码不可用，回退到镜像内置代码 /app/src（不影响本次运行）"
+    RUN_ROOT="$IMAGE_ROOT"
+fi
+
+cd "$RUN_ROOT" 2>/dev/null || cd /app
 exec python src/server.py

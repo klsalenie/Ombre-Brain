@@ -29,6 +29,7 @@ data/
 # Internal design docs, reflections, iteration specs — local only
 docs/internal/
 docs/secret/
+docs/secrets/
 
 # 测试 & 维护工具 —— 不上传（需要时本地维护）
 tests/integration/

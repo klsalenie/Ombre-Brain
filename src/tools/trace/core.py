@@ -78,6 +78,13 @@ async def trace_core(
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
 
+    meta = bucket.get("metadata", {})
+    if 1 <= importance <= 10 and (meta.get("pinned") or meta.get("protected")):
+        return (
+            f"记忆桶 {bucket_id} 是 pinned/protected 核心桶，importance 被锁定为 10，"
+            "本次未修改。请先 trace(bucket_id, pinned=0)，再单独 trace(bucket_id, importance=...)。"
+        )
+
     updates: dict = {}
     if name:
         updates["name"] = name
@@ -149,7 +156,7 @@ async def trace_core(
         except Exception:
             pass
 
-    # --- plan 桶人工/Claude 显式 resolve → 联动 related_bucket / resolved_by ---
+    # --- plan 桶人工/AI 显式 resolve → 联动 related_bucket / resolved_by ---
     # rule.md §1：plan 是承诺，承诺被显式放下，承载它的事件桶也不该再浮上来。
     # 仅在 trace 把 plan.status 改成 resolved 时触发；其他路径（自动二判）不联动。
     cascaded: list[str] = []

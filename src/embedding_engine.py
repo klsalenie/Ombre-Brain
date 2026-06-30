@@ -67,6 +67,30 @@ def _norm_model(name: str) -> str:
     return (name or "").strip().removeprefix("models/").strip().lower()
 
 
+def _humanize_api_error(e: Exception) -> str:
+    """把 OpenAI 兼容后端的常见异常翻成可读中文提示，附在 OB-E001 detail 末尾。
+
+    目的：让错误面板直接看懂 401/400/404/超时该怎么办，尤其跨境 provider 选错的
+    场景（美国 VPS 连国内域名超时、国际站无某模型、key 不匹配 provider）。
+    返回空串表示无额外可补充的提示。
+    """
+    name = type(e).__name__
+    code = getattr(e, "status_code", None)
+    s = str(e).lower()
+    if code == 401 or "authentication" in name.lower() or "401" in s:
+        return "→ 401：API key 无效或无权限，确认 key 正确且属于当前 base_url 的 provider。"
+    if code == 404 or "notfound" in name.lower() or "404" in s:
+        return "→ 404/model 不存在：确认模型名与 base_url 属同一 provider（如 SiliconFlow 国际站可能没有 BAAI/bge-m3）。"
+    if code == 400 or "badrequest" in name.lower():
+        return "→ 400：请求被拒，多为模型名不存在或参数不被支持，核对 model 名。"
+    if "timeout" in name.lower() or "connect" in name.lower() or "timeout" in s:
+        return (
+            "→ 超时/连接失败：检查网络与 base_url 可达性。美国 VPS 直连国内域名"
+            "（api.siliconflow.cn）极易超时，建议改用就近 provider 或本地 ollama。"
+        )
+    return ""
+
+
 # ============================================================
 # 后端基类 / Backend Abstract Base
 # ============================================================
@@ -178,9 +202,10 @@ class APIEmbeddingEngine(BaseEmbeddingEngine):
             )
             return []
         except Exception as e:
+            _hint = _humanize_api_error(e)
             self._record_e001(
                 f"backend=api model={self.model} base_url={self.base_url} "
-                f"err={type(e).__name__}: {e}"
+                f"err={type(e).__name__}: {e}" + (f" {_hint}" if _hint else "")
             )
             return []
 
@@ -446,6 +471,25 @@ class EmbeddingEngine:
             # 实质相同、只差前缀：顺手把 meta 升级成当前写法，避免每次启动重复对账
             self._write_meta("model_name", cur_name)
             old_name = cur_name
+
+        # 模型名相同、但维度不同：几乎必然是后端 _dim 仍是初始默认值（首颗向量生成前
+        # 无法自校正，如 openai_compat 分支 bge-m3 默认 768 而真实 1024），而 db 里
+        # old_dim 是该模型真实输出维度。同一模型维度恒定，直接信任 db 维度校正后端，
+        # 不报 OB-W005——这正是「重算/redeploy 后仍反复报 W005」的根因（对账永远发生
+        # 在自校正之前）。只有模型名真的不同（换了模型）才落到下面报 W005 提示迁移。
+        if (
+            _norm_model(old_name) == _norm_model(cur_name)
+            and old_dim and old_dim != cur_dim
+        ):
+            try:
+                self._backend._dim = int(old_dim)
+                cur_dim = old_dim
+                logger.info(
+                    f"[embedding] 按 db 已存维度校正后端 vector_dim → {old_dim}"
+                    f"（模型 {cur_name} 一致，避免假 OB-W005）"
+                )
+            except (TypeError, ValueError):
+                pass
 
         if _norm_model(old_name) != _norm_model(cur_name) or old_dim != cur_dim:
             try:

@@ -434,7 +434,7 @@ def record_error(
 # ============================================================
 #
 # 设计：MCP 工具调用期间，业务代码（bucket_manager / tools/_common 等）可能在
-# 任意层产生 W/I 级提示。这些提示要透传到 MCP 返回值末尾让 Claude 能看到。
+# 任意层产生 W/I 级提示。这些提示要透传到 MCP 返回值末尾让 AI 能看到。
 # 用 contextvars 维护一个 per-task 的列表；server.py 的 _with_notice 包装器
 # 在工具返回时 pop 出来 append 到末尾。
 # 注意：contextvars 在 asyncio 中按任务隔离，不会跨调用串味。

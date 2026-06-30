@@ -445,6 +445,16 @@ def get_version() -> str:
     return "0.0.0+unknown"
 
 
+def get_ai_name() -> str:
+    """AI 一方的显示名 / display name for the AI side.
+
+    取自环境变量 `AI_NAME`，未设置或为空时回退到 "AI"。面向用户的文本
+    （prompt / UI / 错误信息）、letter 署名都用它，避免硬编码具体模型名。
+    Read from the `AI_NAME` env var; falls back to "AI" when unset/empty.
+    """
+    return os.environ.get("AI_NAME", "").strip() or "AI"
+
+
 def sanitize_name(name: str) -> str:
     """
     Sanitize bucket name, keeping only safe characters.

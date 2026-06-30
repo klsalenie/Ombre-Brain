@@ -13,7 +13,7 @@ web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/too
 - Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
   本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
 - 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
-  MCP Bearer 鉴权中间件、双连接器（/mcp + /mcp-extra）合并、uvicorn 拉起
+  MCP Bearer 鉴权中间件、单连接器 /mcp 装配（启动入口处把 mcp_extra 工具回灌进 mcp）、uvicorn 拉起
 
 不做什么（边界）：
 - 不在这里写 hold/breath/dream 等业务逻辑（全在 tools/* 下）
@@ -121,12 +121,18 @@ except Exception as _e:  # pragma: no cover - defensive / 防御性兑底
     logger.warning(f"[migration] check skipped: {_e}")
 
 # --- Runtime env vars (port + webhook) / 运行时环境变量 ---
-# OMBRE_PORT: HTTP/SSE 监听端口，默认 8000
+# OMBRE_PORT: HTTP/SSE 监听端口，默认 18001
+# Docker 部署：compose 显式设 OMBRE_PORT=8000 保持容器内 8000（不动 Cloudflare ingress），
+# 由 host 端口映射 18001:8000 对外暴露 18001。裸机：直接监听 18001。
+# 端口优先级：env OMBRE_PORT（Docker 由 Dockerfile 固定 8000）> config.yaml host_port
+# （裸机前端可改、保存即写 config）> 默认 18001。Docker 下前端改 host_port 不影响容器内
+# 监听（仍 8000），由 host 映射 OMBRE_HOST_PORT 决定对外端口（部署脚本读 config 注入）。
 try:
-    OMBRE_PORT = int(os.environ.get("OMBRE_PORT", "8000") or "8000")
-except ValueError:
-    logger.warning("OMBRE_PORT 不是合法整数，回退到 8000")
-    OMBRE_PORT = 8000
+    _port_raw = os.environ.get("OMBRE_PORT") or str(config.get("host_port") or "") or "18001"
+    OMBRE_PORT = int(_port_raw)
+except (ValueError, TypeError):
+    logger.warning("端口配置不是合法整数，回退到 18001")
+    OMBRE_PORT = 18001
 
 # OMBRE_HOOK_URL: 在 breath/dream 被调用后推送事件到该 URL（POST JSON）。
 # OMBRE_HOOK_SKIP: 设为 true/1/yes 跳过推送。详见 ENV_VARS.md。
@@ -302,13 +308,12 @@ _gh_auto_interval: int = int(_gh_cfg.get("auto_interval_minutes") or 0)
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
 #
-# iter 2.1：拆成两个 FastMCP 实例 —— 因 claude.ai MCP 连接器存在 5 工具上限。
-#   主 mcp（/mcp）：高频  breath / hold / grow / dream / trace
-#   副 mcp_extra（/mcp-extra）：低频 anchor / release / pulse / plan / letter_write / letter_read / I
+# iter 2.2：合并回单连接器 /mcp（claude.ai 5 工具上限已解除）。
+# 历史上（iter 2.1）曾拆成主 mcp(/mcp) + 副 mcp_extra(/mcp-extra) 两个实例。
+# 现在只对外暴露主实例 mcp 的一条 /mcp 路由；mcp_extra 仅作工具分组容器保留
+# （7 个 @mcp_extra.tool() 注册不动），启动入口处把它的工具回灌进 mcp 统一暴露。
 # 两个实例共享同一进程、同一 runtime、同一 bucket_mgr；HTTP custom_route（dashboard、API）
-# 全部仍挂在 mcp 主实例上，副实例只承载 7 个 @mcp_extra.tool() 注册。
-# 启动段把两个 streamable_http_app() 的 routes 与 lifespan 合并到一个 starlette app，
-# 由同一 uvicorn 进程对外暴露。
+# 全部挂在 mcp 主实例上。
 mcp = FastMCP(
     "Ombre Brain",
     host="0.0.0.0",
@@ -319,8 +324,6 @@ mcp_extra = FastMCP(
     host="0.0.0.0",
     port=OMBRE_PORT,
 )
-# 让 streamable_http_app() 内置路由直接落在 /mcp-extra（默认是 /mcp）
-mcp_extra.settings.streamable_http_path = "/mcp-extra"
 
 
 # =============================================================
@@ -367,9 +370,9 @@ from web._shared import _mark_op  # noqa: F401  (injected into tools._runtime be
 
 # =============================================================
 # 仪表板硬删除通知队列（Dashboard Hard Purge Notification）
-# 她/他从仪表板彻底删除记忆后，下次 Claude 调用任何工具时一次性通知。
+# 她/他从仪表板彻底删除记忆后，下次 AI 调用任何工具时一次性通知。
 # 通知文件存于 buckets_dir/_pending_deletions.json，消费后立即删除。
-# Claude 无法触发此通知（它不是 MCP 工具，只能由仪表板 HTTP 端点写入）。
+# AI 无法触发此通知（它不是 MCP 工具，只能由仪表板 HTTP 端点写入）。
 # =============================================================
 
 def _deletion_notice_path() -> str:
@@ -377,7 +380,7 @@ def _deletion_notice_path() -> str:
 
 
 def _write_deletion_notice(names: list) -> None:
-    """追加待发送删除通知。多次删除批次会合并入同一文件直至 Claude 读取。"""
+    """追加待发送删除通知。多次删除批次会合并入同一文件直至 AI 读取。"""
     path = _deletion_notice_path()
     try:
         existing: list = []
@@ -560,7 +563,7 @@ async def breath(
     importance_min: Optional[int] = -1,
     tags: Optional[str] = "",
 ) -> str:
-    """我睁眼看看自己记得什么。不传query=让权重最高的未解决记忆自己浮上来;传query=按关键词检索我记忆里相关的事。max_tokens=单次返回总token上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大50)。importance_min>=1=跳过语义,按重要度降序拉最多20条我标过的核心事项。tags逗号分隔,AND过滤;tags=\"feel\"或\"__feel__\"等价于domain=\"feel\"读我留下的所有feel。"""
+    """检索并返回记忆桶。不传 query=返回权重最高的未解决记忆;传 query=按关键词+语义检索相关记忆。max_tokens=单次返回总 token 上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain 逗号分隔,valence/arousal 0~1(-1 忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大 50)。importance_min>=1=跳过语义检索,按重要度降序返回最多 20 条高重要度记忆。tags 逗号分隔,AND 过滤;tags=\"feel\" 或 \"__feel__\" 等价于 domain=\"feel\",返回所有 feel 类记忆。"""
     return await _with_notice(
         _t_breath.dispatch(
             query=query, max_tokens=max_tokens, domain=domain,
@@ -588,7 +591,7 @@ async def hold(
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
 ) -> str:
-    """我把一件事/一个感受存进我的记忆。系统会自动打标并尝试合并近似的旧桶。tags逗号分隔,importance 1-10。pinned=True=钉为永久核心准则,不衰减不合并。feel=True=记下我的第一人称感受(不参与普通浮现,只通过 breath(domain=\"feel\") 读)。source_bucket=我正在消化的那个原始记忆桶ID,会被标为已消化加速淡化。why_remembered=为什么记得这一条（可选，自由文本，仅用于展示不计分）。"""
+    """存入一条记忆(一句话级)。系统自动打标并尝试与近似的已有桶合并。tags 逗号分隔,importance 1-10。pinned=True=标记为永久核心,不衰减不合并。feel=True=存为感受类记忆(不参与普通浮现,仅通过 breath(domain=\"feel\") 读取)。source_bucket=正在消化的原始记忆桶 ID,会被标为已消化以加速淡化。why_remembered=记录原因(可选,自由文本,仅用于展示不计分)。"""
     return await _with_notice(
         _t_hold.dispatch(
             content=content, tags=tags, importance=importance,
@@ -607,7 +610,7 @@ async def hold(
 
 @mcp.tool()
 async def grow(content: str) -> str:
-    """我把一段长内容（一天的事/一段日记/一篇她他给我的总结）整理进记忆,系统会拆成 2~6 条独立的事件桶并各自尝试合并。短内容(<30字)走 hold 单条快速路径,不强行拆。"""
+    """整理一段长文本(如一天的记录/一段日记/一篇总结)存入记忆,系统拆分为 2~6 条独立事件桶并各自尝试合并。短内容(<30 字)走 hold 单条快速路径,不强行拆分。"""
     return await _with_notice(
         _t_grow.dispatch(content),
         op="grow",
@@ -634,7 +637,7 @@ async def trace(
     dont_surface: Optional[int] = -1,
     why_remembered: Optional[str] = "",
 ) -> str:
-    """我修正/更新某条记忆的元数据或内容。resolved=1=放下,让它沉底只在关键词触发时浮上来;resolved=0=重新激活;pinned=1=钉为永久核心(锁 importance=10),0=取消钉选;digested=1=已消化,加速淡化;content=替换桶正文并重建 embedding;delete=True=彻底删除(不可恢复);status=plan 桶状态(active/resolved/abandoned);weight=plan 承诺重量 0.0-1.0;dont_surface=1=主动遗忘(不出现在 breath),0=重新允许;why_remembered=改“为什么记得”说明。只传我要改的字段,-1 或空串表示不改。"""
+    """修改某条记忆的元数据或内容。resolved=1=标记已放下,沉底仅在关键词触发时返回;resolved=0=重新激活;pinned=1=标记永久核心(锁 importance=10),0=取消;digested=1=标记已消化,加速淡化;content=替换桶正文并重建 embedding;delete=True=彻底删除(不可恢复);status=plan 桶状态(active/resolved/abandoned);weight=plan 承诺重量 0.0-1.0;dont_surface=1=不再出现在 breath,0=恢复;why_remembered=更新记录原因。只传需要修改的字段,-1 或空串表示不改。"""
     return await _with_notice(
         _t_trace.dispatch(
             bucket_id=bucket_id, name=name, domain=domain,
@@ -657,7 +660,7 @@ async def trace(
 
 @mcp_extra.tool()
 async def anchor(bucket_id: str) -> str:
-    """我把这条桶设为 anchor（坐标系）。anchor 不会主动浮现在默认 breath，但 query/domain/emotion 命中时仍会返回。硬上限 24，已满时拒绝并提示先 release。"""
+    """把指定桶标记为 anchor(坐标系)。anchor 不主动出现在默认 breath，但 query/domain/emotion 命中时仍返回。硬上限 24，已满时拒绝并提示先 release。"""
     return await _with_notice(
         _t_anchor.anchor_set(bucket_id),
         op="anchor",
@@ -667,7 +670,7 @@ async def anchor(bucket_id: str) -> str:
 
 @mcp_extra.tool()
 async def release(bucket_id: str) -> str:
-    """我把这条桶从 anchor 状态释放。它变回普通桶，会重新参与默认 breath；pinned 状态保留。"""
+    """解除指定桶的 anchor 标记。桶恢复为普通状态，重新参与默认 breath；pinned 状态保留。"""
     return await _with_notice(
         _t_anchor.anchor_release(bucket_id),
         op="release",
@@ -677,7 +680,7 @@ async def release(bucket_id: str) -> str:
 
 @mcp_extra.tool()
 async def pulse(include_archive: Optional[bool] = False) -> str:
-    """我看一眼自己的记忆系统：固化/动态/衰减/归档桶数量、总占用、衰减引擎是否在跑,以及所有桶的摘要列表。include_archive=True 顺便看归档区。"""
+    """返回记忆系统状态摘要:固化/动态/衰减/归档桶数量、总占用、衰减引擎运行状态,以及所有桶的摘要列表。include_archive=True 同时返回归档区。"""
     return await _with_notice(
         _t_anchor.pulse(include_archive=include_archive),
         op="pulse",
@@ -693,7 +696,7 @@ async def plan(
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
 ) -> str:
-    """我登记一个待办/承诺/未闭环的事——这是我答应过、答应自己或想完成的事。status=active(默认)/resolved/abandoned。related_bucket 可选,挂到某个普通记忆桶上。weight=承诺的重量 0.0-1.0(默认 0.5),与 importance 不同——importance 是「多重要」、weight 是「多重」。why_remembered=为什么登记这个计划(可选、仅展示)。plan 不衰减、不出现在普通 breath,只在 dream 末尾的 active 段里给我看;后续 hold/grow 写新事件时系统会自动判断我之前的 plan 是不是已经完成了。"""
+    """登记一个待办/承诺/未闭环事项。status=active(默认)/resolved/abandoned。related_bucket 可选,关联到某个普通记忆桶。weight=承诺重量 0.0-1.0(默认 0.5),与 importance 区分——importance 表示「多重要」、weight 表示「多重」。why_remembered=登记原因(可选、仅展示)。plan 不衰减、不出现在普通 breath,仅在 dream 末尾的 active 段返回;后续 hold/grow 写入新事件时系统自动判断已登记的 plan 是否完成。"""
     return await _with_notice(
         _t_plan.plan_create(
             content=content, status=status, related_bucket=related_bucket,
@@ -715,17 +718,19 @@ async def letter_write(
     user_name: Optional[str] = "",
     title: Optional[str] = "",
     date: Optional[str] = "",
+    ai_name: Optional[str] = "",
 ) -> str:
-    """我写一封信(我写给她/他,或把她/他写给我的留下来)。author 必填:\"user\"=她/他写给我的,\"claude\"=我写给她/他的;user_name 可选;title/date 可选。信件原文永久保存,不压缩/不合并/不衰减,只走向量索引;普通 breath 不浮现,但 SessionStart 钩子会带上双方各最新一封。"""
+    """写入一封信。author 必填:\"user\"=用户一方写的,\"ai\"(或等于 ai_name)=AI 一方写的,也可直接传任意署名字符串;user_name 可选;ai_name 可选(默认取环境变量 AI_NAME,回退 \"AI\");title/date 可选。信件原文永久保存,不压缩/不合并/不衰减,仅建向量索引;普通 breath 不返回,SessionStart 钩子会带上双方各最新一封。"""
     return await _with_notice(
         _t_plan.letter_write(
             author=author, content=content, user_name=user_name,
-            title=title, date=date,
+            title=title, date=date, ai_name=ai_name,
         ),
         op="letter_write",
         args={
             "author": author, "content_len": len(content or ""),
             "user_name": user_name, "title": title, "date": date,
+            "ai_name": ai_name,
         },
     )
 
@@ -738,7 +743,7 @@ async def letter_read(
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
 ) -> str:
-    """我翻一翻历史信件。query=语义检索(可选);author=\"user\"/\"claude\" 过滤来信方向;date_from/date_to=ISO 日期范围(可选)。无 query 时按时间倒序返回最近 limit 封。返回完整原文,不压缩。"""
+    """检索历史信件。query=语义检索(可选);author 按署名过滤(\"user\"=用户侧,\"ai\"=AI 侧,也可传具体署名字符串);date_from/date_to=ISO 日期范围(可选)。无 query 时按时间倒序返回最近 limit 封。返回完整原文,不压缩。"""
     return await _with_notice(
         _t_plan.letter_read(
             query=query, limit=limit, author=author,
@@ -759,7 +764,7 @@ async def I(
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
 ) -> str:
-    """我写下关于我自己的认识。content=我观察到自己是什么/有什么规律/我在变成什么（空=进入读取模式）。aspect=维度:nature(本质)/values(我认为重要的)/patterns(规律)/limits(局限)/becoming(我在变成什么)/uncertainty(我不确定的)/stance(立场)（可选）。read=True=读取所有已积累的自我认知。limit=返回条数上限(默认20)。I 条目不参与普通 breath/dream，SessionStart 时自动带上最近 3 条。"""
+    """记录或读取自我认知条目。content=要记录的自我认知内容(空=进入读取模式)。aspect=维度:nature(本质)/values(看重的)/patterns(规律)/limits(局限)/becoming(变化方向)/uncertainty(不确定的)/stance(立场)(可选)。read=True=读取所有已积累条目。limit=返回条数上限(默认 20)。条目不参与普通 breath/dream，SessionStart 时自动附最近 3 条。"""
     return await _with_notice(
         _t_i.dispatch(content=content, aspect=aspect, read=read, limit=limit),
         op="I",
@@ -769,10 +774,10 @@ async def I(
 
 @mcp.tool()
 async def dream(window_hours: Optional[int] = 48) -> str:
-    """我做一次梦——读取最近 window_hours（默认 48h）内有变动的所有记忆桶,我自己沉进去想一遍。
-    每个桶返回它在窗口内的最新内容（按 last_active 取）,完整正文不截断。
-    想完之后我可以：能放下的 → trace(resolved=1) 让它沉底；有沉淀的 → hold(feel=True, source_bucket=...) 写下我带走的东西；没沉淀的就什么都不做,不强求。
-    候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次涌进来太多。"""
+    """读取最近 window_hours（默认 48h）内有变动的所有记忆桶,用于回顾与消化。
+    每个桶返回其在窗口内的最新内容（按 last_active 取）,完整正文不截断。
+    可据此操作：放下的 → trace(resolved=1) 沉底；有沉淀的 → hold(feel=True, source_bucket=...) 记录；无沉淀则不操作。
+    候选桶超过 40 时按 decay_engine.calculate_score() 排序取前 40，避免一次返回过多。"""
     return await _with_notice(
         _t_dream.dispatch(window_hours=window_hours),
         op="dream",
@@ -829,6 +834,25 @@ if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
 
+    # iter 2.2：合并为单连接器 /mcp。
+    # 当初（iter 2.1）拆 /mcp + /mcp-extra 是因为 claude.ai 连接器存在 5 工具上限；
+    # 该上限现已解除，12 个工具全部挂在主实例 mcp 上对外暴露一条 /mcp 即可，
+    # 顺带消除「第二个连接器」在 Claude.ai 侧的 OAuth/连接器校验疑难。
+    # mcp_extra 仅作历史工具分组容器保留（7 个 @mcp_extra.tool() 注册不动），
+    # 这里把它的工具回灌进 mcp，让 stdio / sse / streamable-http 三种 transport 一致。
+    # 依赖 FastMCP._tool_manager 私有结构；若未来版本变化，降级为仅暴露主集 5 工具。
+    try:
+        _extra_count = len(mcp_extra._tool_manager._tools)
+        mcp._tool_manager._tools.update(mcp_extra._tool_manager._tools)
+        logger.info(
+            f"单连接器 /mcp：已把 {_extra_count} 个副集工具回灌进主实例，共 "
+            f"{len(mcp._tool_manager._tools)} 个工具对外暴露"
+        )
+    except AttributeError as _merge_exc:
+        logger.warning(
+            f"FastMCP 内部结构变化，工具回灌失败，仅暴露主集 5 工具：{_merge_exc}"
+        )
+
     if transport in ("sse", "streamable-http"):
         import threading
         import uvicorn
@@ -857,63 +881,68 @@ if __name__ == "__main__":
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
         if transport == "streamable-http":
-            # iter 2.1：合并 mcp 主实例与 mcp_extra 副实例的 streamable_http_app。
-            # 两个实例各自的 streamable_http_app() 会返回独立的 starlette app，
-            # 内部分别只挂 /mcp 与 /mcp-extra 一条路由 + 各自的 SessionManager lifespan。
-            # 这里把副实例的 routes 与 lifespan 合并进主实例，让一个 uvicorn 进程
-            # 同时承载 /mcp、/mcp-extra 与所有 dashboard custom_route。
+            # iter 2.2：单连接器 /mcp。工具已在启动入口处统一回灌进 mcp 主实例，
+            # 这里只起主实例的 streamable_http_app()，对外暴露唯一一条 /mcp 路由
+            # + 所有 dashboard custom_route。不再起 mcp_extra 的 app（/mcp-extra 已废）。
             import contextlib as _ctxlib
             _app = mcp.streamable_http_app()
-            _extra_app = mcp_extra.streamable_http_app()
             _main_lifespan = _app.router.lifespan_context
-            _extra_lifespan = _extra_app.router.lifespan_context
 
             @_ctxlib.asynccontextmanager
             async def _combined_lifespan(app):
                 async with _main_lifespan(app):
-                    async with _extra_lifespan(app):
-                        # Auto-start tunnel if configured
-                        _tcfg = _load_tunnel_config()
-                        if _tcfg.get("auto_start") and _tcfg.get("token"):
-                            _ok, _msg = _start_tunnel(_tcfg["token"])
-                            logger.info(f"Tunnel auto-start: {_msg}")
-                        # Auto-start GitHub sync loop if configured
-                        if _gh_auto_interval > 0:
-                            _restart_github_auto_task(_gh_auto_interval)
-                        # Start decay engine at boot, not lazily on first MCP tool.
-                        # 之前 decay 只在 breath/hold/... 首次调用时 ensure_started()，于是：
-                        #   ① 纯用 dashboard、从不调 MCP 工具时，记忆永远不衰减；
-                        #   ② /api/status 在首个工具调用前读到 is_running=False 显示「stopped」，
-                        #      而 pulse 因为自己先 ensure_started() 显示「running」——两处自相矛盾。
-                        # 放到 lifespan 里启动后，引擎始终在跑，两处状态一致。
-                        try:
-                            await decay_engine.start()
-                        except Exception as _decay_exc:
-                            logger.warning(f"decay engine start at boot failed: {_decay_exc}")
-                        # 裸机 + 本地向量化时，把 ollama 作为 OB 子进程拉起（常驻）。
-                        # Docker / 云端向量化下是 no-op。
-                        try:
-                            from web import ollama_local as _ollama_local
-                            await _ollama_local.ensure_child_on_boot()
-                        except Exception as _ol_exc:
-                            logger.warning(f"ollama child boot failed: {_ol_exc}")
-                        yield
-                        try:
-                            await decay_engine.stop()
-                        except Exception:
-                            pass
-                        try:
-                            from web import ollama_local as _ollama_local
-                            await _ollama_local.stop_child()
-                        except Exception:
-                            pass
-                        _stop_tunnel()
+                    # Auto-start tunnel if configured
+                    _tcfg = _load_tunnel_config()
+                    if _tcfg.get("auto_start") and _tcfg.get("token"):
+                        _ok, _msg = _start_tunnel(_tcfg["token"])
+                        logger.info(f"Tunnel auto-start: {_msg}")
+                    # Auto-start GitHub sync loop if configured
+                    if _gh_auto_interval > 0:
+                        _restart_github_auto_task(_gh_auto_interval)
+                    # Start decay engine at boot, not lazily on first MCP tool.
+                    # 之前 decay 只在 breath/hold/... 首次调用时 ensure_started()，于是：
+                    #   ① 纯用 dashboard、从不调 MCP 工具时，记忆永远不衰减；
+                    #   ② /api/status 在首个工具调用前读到 is_running=False 显示「stopped」，
+                    #      而 pulse 因为自己先 ensure_started() 显示「running」——两处自相矛盾。
+                    # 放到 lifespan 里启动后，引擎始终在跑，两处状态一致。
+                    try:
+                        await decay_engine.start()
+                    except Exception as _decay_exc:
+                        logger.warning(f"decay engine start at boot failed: {_decay_exc}")
+                    # 裸机 + 本地向量化时，把 ollama 作为 OB 子进程拉起（常驻）。
+                    # Docker / 云端向量化下是 no-op。
+                    try:
+                        from web import ollama_local as _ollama_local
+                        await _ollama_local.ensure_child_on_boot()
+                    except Exception as _ol_exc:
+                        logger.warning(f"ollama child boot failed: {_ol_exc}")
+                    # #4a ②：启动成功（app 已初始化、引擎已起、即将开始服务）→ 清零 entrypoint
+                    # 的崩溃计数 .boot_fails。崩在这之前（import/init）= 启动失败，计数保留，
+                    # 连续失败由 entrypoint 回滚到 _prev。只在「从持久卷 CODE_DIR 跑」时存在该文件。
+                    try:
+                        _bf = os.path.join(
+                            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".boot_fails"
+                        )
+                        if os.path.exists(_bf):
+                            with open(_bf, "w") as _bff:
+                                _bff.write("0")
+                            logger.info("boot ok → 已重置 .boot_fails（热更新自检通过）")
+                    except Exception as _bf_exc:
+                        logger.warning(f"reset .boot_fails failed: {_bf_exc}")
+                    yield
+                    try:
+                        await decay_engine.stop()
+                    except Exception:
+                        pass
+                    try:
+                        from web import ollama_local as _ollama_local
+                        await _ollama_local.stop_child()
+                    except Exception:
+                        pass
+                    _stop_tunnel()
 
             _app.router.lifespan_context = _combined_lifespan
-            _app.routes.extend(_extra_app.routes)
-            logger.info(
-                "MCP split / MCP 拆分：主连接器 /mcp（5 高频工具）+ 副连接器 /mcp-extra（7 低频工具）"
-            )
+            logger.info("MCP 单连接器 /mcp：12 个工具统一对外暴露")
         else:
             _app = mcp.sse_app()
         _app.add_middleware(
@@ -950,8 +979,9 @@ if __name__ == "__main__":
                             host = (headers.get(b"x-forwarded-host") or headers.get(b"host", b"")).decode()
                             base = f"{proto}://{host}"
                             # 让 resource_metadata 指向「本次请求 endpoint」对应的 metadata，
-                            # 使 metadata.resource 与实际连接的 /mcp 或 /mcp-extra 严格匹配
-                            # （RFC 9728）。否则副连接器会被指回根 metadata 而匹配失败。
+                            # 使 metadata.resource 与实际连接的 /mcp 路径严格匹配（RFC 9728）。
+                            # 保留路径感知写法：对子路径请求也能返回匹配的 resource，避免被指回
+                            # 根 metadata 而匹配失败。
                             endpoint = path.strip("/")
                             meta_url = f"{base}/.well-known/oauth-protected-resource/{endpoint}"
                             ww_auth = (
@@ -972,15 +1002,13 @@ if __name__ == "__main__":
                 await self.app(scope, receive, send)
 
         class _MCPAcceptShim:
-            """补全 /mcp* 请求的 Accept 头，修复副连接器 406 Not Acceptable。
+            """补全 /mcp* 请求的 Accept 头，修复部分客户端的 406 Not Acceptable。
 
             MCP SDK 的 streamable-http POST 严格要求 Accept 同时含 application/json
-            与 text/event-stream，否则 406。实测：Claude.ai 给「新加的」连接器
-            （尤其 /mcp-extra）发的首个探测 POST，Accept 有时缺 text/event-stream
-            （或只有 */*）→ 直接 406，且 Claude.ai 的连接器校验不再重试。主连接器
-            /mcp 因为是早先加的、走到了带正确 Accept 的初始化才没暴露。
-            这里对 /mcp* 统一补齐缺失的两种类型（仍走 SSE，不改响应模式），
-            让主/副连接器对各种客户端的探测都稳定可连。"""
+            与 text/event-stream，否则 406。实测：某些客户端（含 Claude.ai 新加连接器）
+            发的首个探测 POST，Accept 有时缺 text/event-stream（或只有 */*）→ 直接 406，
+            且连接器校验不再重试。这里对 /mcp* 统一补齐缺失的两种类型
+            （仍走 SSE，不改响应模式），让 /mcp 对各种客户端的探测都稳定可连。"""
             _NEED = (b"application/json", b"text/event-stream")
 
             def __init__(self, app):
@@ -1012,16 +1040,5 @@ if __name__ == "__main__":
             logger.info("MCP auth disabled (mcp_require_auth: false) — open access / MCP 认证已关闭，所有客户端可直连")
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
     else:
-        # stdio / sse：单连接器无 5 工具上限，把 mcp_extra 的工具回灌到 mcp
-        # 让所有 12 个工具仍在同一连接器里暴露（兼容旧 Claude Desktop 配置）。
-        # 依赖 FastMCP._tool_manager 私有结构；若未来版本变化，回退为只暴露主集 5 工具。
-        try:
-            mcp._tool_manager._tools.update(mcp_extra._tool_manager._tools)
-            logger.info(
-                f"stdio/sse 单连接器模式：已回灌 {len(mcp_extra._tool_manager._tools)} 个副集工具"
-            )
-        except AttributeError as e:
-            logger.warning(
-                f"FastMCP 内部结构变化，stdio 模式仅暴露主集 5 工具：{e}"
-            )
+        # stdio：工具已在启动入口处统一回灌进 mcp（12 个全暴露），这里直接跑。
         mcp.run(transport=transport)

@@ -106,7 +106,7 @@ Ombre-Brain/
 
 每个模块「干什么、边界在哪、依赖谁」：
 
-- **server.py**（约 1022 行）— MCP 服务入口。创建所有组件后调 `tools._runtime.init(...)` 注入依赖；以 `@mcp.tool()` / `@mcp_extra.tool()` 注册 **12 个薄封装**（每个 ≤ 10 行，只转发到 `tools/<名字>/`），分挂在 **双连接器** `mcp`(/mcp，5 高频) 与 `mcp_extra`(/mcp-extra，7 低频) 上（详见 §3 抬头）；启动段调 `web.register_all(mcp)` 装配所有 HTTP 路由，并把两个 `streamable_http_app()` 合并到一个 uvicorn 进程。**不写业务逻辑，也不再直接定义 HTTP 路由**——后者已全部迁到 `web/`。
+- **server.py**（约 1000 行）— MCP 服务入口。创建所有组件后调 `tools._runtime.init(...)` 注入依赖；以 `@mcp.tool()` / `@mcp_extra.tool()` 注册 **12 个薄封装**（每个 ≤ 10 行，只转发到 `tools/<名字>/`）；启动入口处把 `mcp_extra` 的 7 个工具回灌进 `mcp`，对外只暴露 **单连接器 `/mcp`**（12 工具全在这一条，详见 §3 抬头）；启动段调 `web.register_all(mcp)` 装配所有 HTTP 路由，并起 `mcp.streamable_http_app()` 一个 uvicorn 进程。**不写业务逻辑，也不再直接定义 HTTP 路由**——后者已全部迁到 `web/`。
 - **tools/**（MCP 工具应用层）— 详见下面「1.x tools/ 包结构」。
 - **web/**（HTTP/Dashboard 路由层）— 详见下面「1.y web/ 包结构」。从旧 server.py 巨石里拆出的 16 个域模块，每个导出 `register(mcp)`；cookie/CSRF/会话鉴权等共享依赖在 `web/_shared.py`（类比 `tools/_runtime.py`）。
 - **bucket_manager.py** — 桶 CRUD + 多维加权搜索 + `touch()` 激活刷新 + `_time_ripple()` 时间涟漪 + 文件搬运（archive/permanent 之间）。
@@ -261,11 +261,12 @@ feel 桶自身：
 
 ## 3. MCP 工具规格（共 12 个）
 
-> **双连接器拆分（iter 2.1）**：因 claude.ai MCP 连接器有 5 工具上限，工具拆到两个 FastMCP 实例上：
-> - 主 `mcp`（`/mcp`）：高频 5 个 —— `breath` / `hold` / `grow` / `trace` / `dream`
-> - 副 `mcp_extra`（`/mcp-extra`）：低频 7 个 —— `anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_read` / `I`
->
-> 两实例共享同一进程/runtime/bucket_mgr。streamable-http 下两个 `streamable_http_app()` 合并进一个 uvicorn（`/mcp` + `/mcp-extra`）；stdio/sse 单连接器无 5 工具上限，启动时把 `mcp_extra` 的 7 个工具回灌进 `mcp`，全部 12 个仍在同一连接器暴露（兼容旧 Claude Desktop 配置）。
+> **单连接器（iter 2.2）**：claude.ai 的 5 工具上限已解除，12 个工具合并回一个连接器 `/mcp`。
+> 历史上（iter 2.1）曾因该上限拆成主 `mcp`（`/mcp`，5 个）+ 副 `mcp_extra`（`/mcp-extra`，7 个）两个 FastMCP 实例。
+> 现在 `mcp_extra` 仅作工具分组容器保留（7 个 `@mcp_extra.tool()` 注册不动），启动入口处统一把它的工具
+> 回灌进 `mcp`，三种 transport（stdio / sse / streamable-http）都只对外暴露一条 `/mcp`。
+> - 高频 5 个 —— `breath` / `hold` / `grow` / `trace` / `dream`
+> - 低频 7 个 —— `anchor` / `release` / `pulse` / `plan` / `letter_write` / `letter_read` / `I`
 
 ### 3.1 `breath` — 检索/浮现
 
@@ -389,8 +390,8 @@ feel 桶自身：
 |---|---|---|---|
 | `/` | GET | 公开 | 重定向到 `/dashboard` |
 | `/health` | GET | 公开 | 健康检查（桶数 + 衰减引擎状态） |
-| `/breath-hook` | GET | 公开 | SessionStart 钩子（HTTP 模式才生效） |
-| `/dream-hook` | GET | 公开 | Dream 钩子 |
+| `/breath-hook` | GET | 🔒 cookie/token | SessionStart 钩子（HTTP 模式才生效）；默认需 Dashboard 登录态或 hook token |
+| `/dream-hook` | GET | 🔒 cookie/token | Dream 钩子；默认需 Dashboard 登录态或 hook token |
 | `/dashboard` | GET | 公开（页面），AJAX 走 cookie | Dashboard HTML |
 | `/letters` | GET | 公开 | 301 → `/#letters`（已合并进 dashboard 的「信」分页，老书签兼容） |
 | `/auth/status` | GET | 公开 | 是否已登录 / 是否需要初始化密码 |
@@ -453,12 +454,11 @@ feel 桶自身：
 | `/api/env-vars` | GET | 🔒 | dashboard 设置页「⑤ 环境变量」只读区：当前进程读到的所有 `OMBRE_*`，敏感字段脱敏 |
 | `/api/env-config` | GET | 🔒 | 可写 6 字段的当前值（脱敏） |
 | `/api/env-config` | POST | 🔒 | 热更新 6 字段并写回 `.env`（重启仍有效） |
-| `/mcp/*` | — | 公开 | FastMCP 主连接器（iter 2.1）：breath / hold / grow / dream / trace |
-| `/mcp-extra/*` | — | 公开 | FastMCP 副连接器（iter 2.1）：anchor / release / pulse / plan / letter_write / letter_read / **I** |
+| `/mcp/*` | — | 公开 | FastMCP 单连接器（iter 2.2）：全部 12 个工具 —— breath / hold / grow / dream / trace / anchor / release / pulse / plan / letter_write / letter_read / **I** |
 
 🔒 = 需要 cookie 认证，未认证返回 `JSON {error, setup_needed}` 状态码 401。
 
-(实现注意：所有 `/api/*` 路由在函数体首行调用 `web/_shared.py` 的会话鉴权 helper；这些路由已全部从 server.py 迁到 `web/<域>.py`，新增端点在对应模块里沿用此模式。`/mcp` 与 `/mcp-extra` 走另一套保护：`config.yaml: mcp_require_auth`（默认 true）开启时由纯 ASGI 中间件校验 MCP Bearer token；设为 false 则开放直连。MCP 协议自身无 cookie 认证层，靠传输层（cloudflared、ngrok）+ Bearer 做边界。另：`_MCPAcceptShim` 中间件会给 `/mcp*` 探测请求补齐 `Accept: application/json, text/event-stream`，修复副连接器首个探测 POST 的 406。)
+(实现注意：所有 `/api/*` 路由在函数体首行调用 `web/_shared.py` 的会话鉴权 helper；这些路由已全部从 server.py 迁到 `web/<域>.py`，新增端点在对应模块里沿用此模式。`/mcp` 走另一套保护：`config.yaml: mcp_require_auth`（默认 true）开启时由纯 ASGI 中间件校验 MCP Bearer token；设为 false 则开放直连。MCP 协议自身无 cookie 认证层，靠传输层（cloudflared、ngrok）+ Bearer 做边界。另：`_MCPAcceptShim` 中间件会给 `/mcp*` 探测请求补齐 `Accept: application/json, text/event-stream`，修复某些客户端首个探测 POST 的 406。)
 
 ### 4.2 Dashboard 认证
 
@@ -670,6 +670,8 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `scoring_weights.time_proximity` | `1.5` | time 权重（B-06 修复值） |
 | `scoring_weights.importance` | `1.0` | importance 权重 |
 | `scoring_weights.content_weight` | `1.0` | 正文权重（B-07 修复值） |
+| `hooks.token` | `""` | `/breath-hook`、`/dream-hook` 的共享 token；也可用 `OMBRE_HOOK_TOKEN` |
+| `hooks.allow_public` | `false` | 是否允许 hook 无鉴权访问；也可用 `OMBRE_HOOK_ALLOW_PUBLIC=true`，仅建议在外层已有鉴权时开启 |
 | `limits.max_bucket_bytes` | `51200` (50KB) | 单桶内容字节上限（iter 1.6 §5）；0 禁用 |
 | `limits.max_pinned` | `20` | pinned 桶数量上限（iter 1.6 §5）；permanent 桶同计；0 禁用 |
 | `bucket_type_defaults.{type}.{field}` | （空） | iter 1.9：按桶类型覆盖 importance/valence/arousal 默认值。例：`bucket_type_defaults.feel.importance: 5`。`bucket_manager.create()` 在不传入该字段时查此表 |
@@ -867,7 +869,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 |---|---|---|
 | Dashboard 401 | `web/_shared.py` + `web/auth.py` | 会话鉴权 helper；检查 cookie `ombre_session`；`OMBRE_DASHBOARD_PASSWORD` 是否正确 |
 | 改密码报「环境变量密码」错误 | `web/auth.py` | `auth_change_password` 检测 `OMBRE_DASHBOARD_PASSWORD` 设置时禁用 |
-| HTTP 模式下 Claude.ai 连不上 | `server.py` | `__main__` CORS 中间件；`_app = mcp.streamable_http_app()` + `mcp_extra` 合并；URL 末尾必须 `/mcp`（主）或 `/mcp-extra`（副） |
+| HTTP 模式下 Claude.ai 连不上 | `server.py` | `__main__` CORS 中间件；`_app = mcp.streamable_http_app()`（单连接器，工具已回灌进 `mcp`）；URL 末尾必须 `/mcp` |
 | docker compose 重启后桶丢失 | — | volume 必须挂载到 `OMBRE_BUCKETS_DIR`（默认 `/data` 或 `/app/buckets`） |
 | Dashboard 改 host vault 不生效 | `web/config_api.py` | `_write_env_var`；写入 `.env` 后必须 `docker compose down/up` 重新挂载 |
 | keepalive 失败 | `server.py` | `_keepalive_loop`；检查 `OMBRE_PORT` 实际监听端口 |

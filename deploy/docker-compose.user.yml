@@ -26,7 +26,8 @@ services:
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # 对外默认 18001 → 容器内 8000（镜像固定）。换端口：.env 设 OMBRE_HOST_PORT。
+      - "${OMBRE_HOST_PORT:-18001}:8000"
     environment:
       - OMBRE_TRANSPORT=streamable-http
       # config 放进数据卷（./buckets），而不是单文件挂载 —— 见文件顶部说明。

@@ -28,6 +28,19 @@ log_level: "INFO"
 #    another auth layer at the reverse proxy — otherwise anyone can read/write memories.
 mcp_require_auth: true
 
+# --- HTTP hooks auth / HTTP 钩子鉴权 ---
+# /breath-hook and /dream-hook are protected by default.
+# They accept the Dashboard login cookie, or this token via:
+#   ?token=...
+#   X-Ombre-Hook-Token: ...
+#   Authorization: Bearer ...
+# Set allow_public=true only behind another trusted auth layer.
+# /breath-hook 和 /dream-hook 默认不公开；可用 Dashboard 登录态或 token 调用。
+# 只有在反代层另有鉴权时，才建议显式打开 allow_public。
+hooks:
+  token: ""
+  allow_public: false
+
 # --- Bucket storage path / 记忆桶存储路径 ---
 # Point this to your Obsidian vault subdirectory, or any local folder
 # 指向你的 Obsidian 仓库子目录，或任意本地文件夹
@@ -98,9 +111,9 @@ matching:
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
 
 # --- Surfacing defaults / 浮现默认参数 ---
-# Defaults applied when Claude calls breath() without explicit caps.
+# Defaults applied when the AI calls breath() without explicit caps.
 # Front-end Settings panel writes the same fields back here.
-# Claude 调用 breath() 不显式传 max_* 时使用这些默认；前端「浮现默认参数」面板会回写到这里。
+# AI 调用 breath() 不显式传 max_* 时使用这些默认；前端「浮现默认参数」面板会回写到这里。
 surfacing:
   breath_max_results: 20          # 1-50, hard cap of buckets returned per breath
   breath_max_tokens: 10000        # 500-20000, total token cap per breath
