@@ -19,7 +19,7 @@ services:
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}      # From .env file / 从 .env 文件读取
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
-      - OMBRE_BUCKETS_DIR=/data             # Container-internal bucket path / 容器内路径
+      - OMBRE_BUCKETS_DIR=/app/buckets         # Container-internal bucket path / 容器内路径
     volumes:
       # Mount your Obsidian vault (or any host directory) for persistent storage.
       # Set OMBRE_HOST_VAULT_DIR in your .env (or in the Dashboard "Storage" panel)
@@ -31,7 +31,7 @@ services:
       # Examples / 示例:
       #   OMBRE_HOST_VAULT_DIR=/path/to/your/Obsidian Vault/Ombre Brain
       #   OMBRE_HOST_VAULT_DIR=~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Ombre Brain
-      - ${OMBRE_HOST_VAULT_DIR:-./buckets}:/data
+      - ${OMBRE_HOST_VAULT_DIR:-./app/buckets}:/data
       - ./config.yaml:/app/config.yaml
 
   # Cloudflare Tunnel (optional) — expose to public internet
