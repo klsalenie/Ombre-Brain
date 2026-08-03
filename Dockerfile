@@ -17,21 +17,35 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install cloudflared + curl (for downloading cloudflared)
-# 安装 cloudflared（用于 Tunnel 一键管理功能）
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
-    && ARCH=$(dpkg --print-architecture) \
-    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" \
-       -o /usr/local/bin/cloudflared \
-    && chmod +x /usr/local/bin/cloudflared \
-    && apt-get remove -y curl \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+# cloudflared（用于 Dashboard 的 Tunnel 一键管理）。
+# 用镜像自带的 python 直接从 GitHub Releases 下载（带重试），不装 curl、不跑
+# apt-get update —— 从根上避开 Debian 镜像源间歇性 502 导致的构建失败（用户反馈 #3）。
+# 不需要 Tunnel 的用户可 `docker build --build-arg INSTALL_CLOUDFLARED=0 ...` 完全跳过。
+ARG INSTALL_CLOUDFLARED=1
+COPY deploy/fetch_cloudflared.py /tmp/fetch_cloudflared.py
+RUN set -eu; \
+    if [ "$INSTALL_CLOUDFLARED" = "1" ]; then \
+        python /tmp/fetch_cloudflared.py /usr/local/bin/cloudflared; \
+        chmod +x /usr/local/bin/cloudflared; \
+    else \
+        echo "[build] INSTALL_CLOUDFLARED=0 → 跳过 cloudflared（Tunnel 一键管理将不可用）"; \
+    fi; \
+    rm -f /tmp/fetch_cloudflared.py
 
 # Install dependencies first (leverage Docker cache)
 # 先装依赖（利用 Docker 缓存）
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 可选 pip 镜像源：受限网络（宿主代理掐断 PyPI）时传
+#   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple --build-arg PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+# 默认留空 → 官方 PyPI，行为不变。
+ARG PIP_INDEX_URL=""
+ARG PIP_TRUSTED_HOST=""
+# GitHub 源码归档会排除开发者使用的宽松 requirements.txt；镜像安装只依赖
+# 带 hash 的权威生产锁，因此 clone 与归档构建统一只复制该文件。
+COPY requirements.lock.txt ./
+RUN pip install --no-cache-dir --retries 10 --timeout 120 \
+        ${PIP_INDEX_URL:+-i "$PIP_INDEX_URL"} \
+        ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} \
+        --require-hashes -r requirements.lock.txt
 
 # Copy project files / 复制项目文件
 COPY src/ ./src/
@@ -40,6 +54,14 @@ COPY VERSION ./VERSION
 COPY config.example.yaml ./config.default.yaml
 COPY entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
+
+# 面向用户的说明文档：Docker 用户本地无源码、镜像此前也不含这些文件，
+# 导致「给 Claude 的使用指南」（README）指向的 docs/CLAUDE_PROMPT.md 拿不到，
+# 出现「服务装完了但模型没拿到使用约定」的 onboarding 断点。内部设计稿
+# （docs/superpowers、docs/secrets 等）不在此列，仍被 .dockerignore 挡在外面。
+COPY docs/CLAUDE_PROMPT.md docs/ENVIRONMENT_VARIABLES.md docs/INTERNALS.md docs/MULTI_OWNER.md docs/OPERATIONS.md ./docs/
+COPY README.md ./README.md
+COPY CHANGELOG.md ./CHANGELOG.md
 
 # Persistent mount point: bucket data
 # 持久化挂载点：记忆数据

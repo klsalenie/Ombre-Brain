@@ -19,6 +19,8 @@
 #      OMBRE_COMPRESS_API_KEY  — 压缩/脱水用的 LLM key（必填）
 #      OMBRE_DASHBOARD_PASSWORD — Dashboard 登录密码（必填）
 #      向量化的 key/base_url/model 可留空，之后在 Dashboard 里随时填、即时生效。
+#   3. 想固定数据目录：在本文件旁的 .env 设置 OMBRE_HOST_VAULT_DIR=/绝对/路径。
+#      该目录同时保存 buckets、config.yaml 和 Tunnel token，--force-recreate 不会清空。
 
 services:
   ombre-brain:
@@ -26,10 +28,17 @@ services:
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      # 对外默认 18001 → 容器内 8000（镜像固定）。换端口：.env 设 OMBRE_HOST_PORT。
-      - "${OMBRE_HOST_PORT:-18001}:8000"
+      # 默认只绑本机，避免首启设密页在公网被抢占。确需 LAN/公网直连时
+      # 在 .env 设 OMBRE_BIND_ADDRESS=0.0.0.0，并保持 MCP OAuth/静态 Token 鉴权；
+      # Dashboard 强密码本身不能保护免鉴权的 /mcp。
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:${OMBRE_HOST_PORT:-18001}:8000"
     environment:
       - OMBRE_TRANSPORT=streamable-http
+      # 容器内安全门禁据此区分宿主回环绑定与局域网/公网暴露。
+      - OMBRE_BIND_ADDRESS=${OMBRE_BIND_ADDRESS:-127.0.0.1}
+      - OMBRE_ALLOW_INSECURE_MCP=${OMBRE_ALLOW_INSECURE_MCP:-false}
+      - OMBRE_MCP_AUTH_MODE=${OMBRE_MCP_AUTH_MODE:-}
+      - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:-}
       # config 放进数据卷（./buckets），而不是单文件挂载 —— 见文件顶部说明。
       # 首启自动生成，Dashboard 改动持久化到这里，重启不丢。
       - OMBRE_CONFIG_PATH=/app/buckets/config.yaml
@@ -39,9 +48,17 @@ services:
       - OMBRE_EMBED_API_KEY=${OMBRE_EMBED_API_KEY:-}
       - OMBRE_EMBED_BASE_URL=${OMBRE_EMBED_BASE_URL:-}
       - OMBRE_EMBED_MODEL=${OMBRE_EMBED_MODEL:-}
-      - OMBRE_DASHBOARD_PASSWORD=${OMBRE_DASHBOARD_PASSWORD}
+      - OMBRE_DASHBOARD_PASSWORD=${OMBRE_DASHBOARD_PASSWORD:?OMBRE_DASHBOARD_PASSWORD is required}
+      # Trust forwarded origin headers only from the configured last-hop proxy.
+      - "OMBRE_TRUSTED_PROXY_CIDRS=${OMBRE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
+      - OMBRE_HOST_VAULT_DIR=${OMBRE_HOST_VAULT_DIR:-}
+      # 默认跳过 SRV edge discovery，兼容 VPN 提供的不完整 DNS resolver。
+      - TUNNEL_EDGE=${TUNNEL_EDGE-region1.v2.argotunnel.com:7844,region2.v2.argotunnel.com:7844}
+      - TUNNEL_TRANSPORT_PROTOCOL=${TUNNEL_TRANSPORT_PROTOCOL:-http2}
     volumes:
-      - ./buckets:/app/buckets
+      - type: bind
+        source: ${OMBRE_HOST_VAULT_DIR:-./buckets}
+        target: /app/buckets
       # 注意：不要加 `- ./config.yaml:/app/config.yaml`，那会在 Windows 上被建成目录导致崩溃。
 
   # ── 可选：本地向量化（Ollama + bge-m3）。默认不启动 ──

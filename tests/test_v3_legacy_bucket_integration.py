@@ -7,6 +7,16 @@ from ombrebrain.app.legacy_runtime import LegacyRuntime
 from ombrebrain.protocol.schemas import MemoryType
 
 
+class FakeEmbeddingEngine:
+    enabled = True
+
+    async def generate_and_store(self, bucket_id, content):
+        return True
+
+    def delete_embedding(self, bucket_id):
+        return None
+
+
 @pytest.fixture
 def config(tmp_path):
     buckets_dir = tmp_path / "buckets"
@@ -22,10 +32,15 @@ def config(tmp_path):
     }
 
 
+@pytest.fixture
+def fake_embedding_engine():
+    return FakeEmbeddingEngine()
+
+
 @pytest.mark.asyncio
-async def test_bucket_manager_create_records_v3_event_without_changing_markdown_behavior(config) -> None:
+async def test_bucket_manager_create_records_v3_event_without_changing_markdown_behavior(config, fake_embedding_engine) -> None:
     runtime = LegacyRuntime.from_config(config)
-    manager = BucketManager(config, v3_runtime=runtime)
+    manager = BucketManager(config, embedding_engine=fake_embedding_engine, v3_runtime=runtime)
 
     bucket_id = await manager.create(
         content="legacy write",
@@ -46,9 +61,9 @@ async def test_bucket_manager_create_records_v3_event_without_changing_markdown_
 
 
 @pytest.mark.asyncio
-async def test_bucket_manager_update_delete_and_archive_record_v3_lifecycle_events(config) -> None:
+async def test_bucket_manager_update_delete_and_archive_record_v3_lifecycle_events(config, fake_embedding_engine) -> None:
     runtime = LegacyRuntime.from_config(config)
-    manager = BucketManager(config)
+    manager = BucketManager(config, embedding_engine=fake_embedding_engine)
     manager.attach_v3_runtime(runtime)
     bucket_id = await manager.create(content="first", bucket_type="dynamic")
 
@@ -62,12 +77,12 @@ async def test_bucket_manager_update_delete_and_archive_record_v3_lifecycle_even
 
 
 @pytest.mark.asyncio
-async def test_bucket_manager_v3_recording_failure_does_not_break_legacy_create(config) -> None:
+async def test_bucket_manager_v3_recording_failure_does_not_break_legacy_create(config, fake_embedding_engine) -> None:
     class BrokenRuntime:
         def record_bucket_event(self, **_kwargs):
             raise RuntimeError("v2.4.0 offline")
 
-    manager = BucketManager(config, v3_runtime=BrokenRuntime())
+    manager = BucketManager(config, embedding_engine=fake_embedding_engine, v3_runtime=BrokenRuntime())
 
     bucket_id = await manager.create(content="still works")
 

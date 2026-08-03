@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import tools._runtime as rt
-from tools.breath.importance import surface_by_importance
+from tools.breath.importance import _select_importance_buckets, surface_by_importance
 from tools.trace.core import trace_core
 
 
@@ -19,6 +19,65 @@ def install_runtime(bucket_mgr):
     rt.logger = MagicMock()
     rt.fire_webhook = None
     rt.mark_op = None
+
+
+def test_importance_selection_deduplicates_before_short_result_return():
+    first = {
+        "id": "duplicate",
+        "content": "canonical",
+        "metadata": {"importance": 9, "created": "2026-01-01"},
+    }
+    duplicate = {
+        "id": "duplicate",
+        "content": "stale physical copy",
+        "metadata": {"importance": 10, "created": "2026-02-01"},
+    }
+    unique = {
+        "id": "unique",
+        "content": "other",
+        "metadata": {"importance": 9, "created": "2026-01-02"},
+    }
+
+    selected = _select_importance_buckets(
+        [first, duplicate, unique], importance_min=9, limit=20
+    )
+
+    assert len(selected) == 2
+    assert next(row for row in selected if row["id"] == "duplicate") is first
+
+
+@pytest.mark.asyncio
+async def test_importance_surface_filters_after_canonical_id_deduplication():
+    class StaticManager:
+        async def list_all(self, include_archive=False):
+            assert include_archive is False
+            return [
+                {
+                    "id": "duplicate",
+                    "content": "canonical hidden copy",
+                    "metadata": {
+                        "importance": 9,
+                        "dont_surface": True,
+                        "type": "dynamic",
+                    },
+                },
+                {
+                    "id": "duplicate",
+                    "content": "stale visible copy",
+                    "metadata": {"importance": 10, "type": "dynamic"},
+                },
+                {
+                    "id": "visible",
+                    "content": "visible canonical memory",
+                    "metadata": {"importance": 9, "type": "dynamic"},
+                },
+            ]
+
+    install_runtime(StaticManager())
+    result = await surface_by_importance(9, 10_000, [])
+
+    assert "visible canonical memory" in result
+    assert "stale visible copy" not in result
 
 
 @pytest.mark.asyncio

@@ -24,9 +24,16 @@ breath 中。
 ========================================
 """
 
+import math
 from typing import Optional
 
 from .. import _runtime as rt
+from .._common import (
+    check_content_size,
+    check_metadata_size,
+    check_query_size,
+    stored_data_marker,
+)
 from utils import strip_wikilinks, get_ai_name
 
 
@@ -37,15 +44,35 @@ async def plan_create(
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
 ) -> str:
-    if status is None: status = "active"
-    if related_bucket is None: related_bucket = ""
-    if weight is None: weight = 0.5
-    if why_remembered is None: why_remembered = ""
-    weight = max(0.0, min(1.0, float(weight)))
+    if status is None:
+        status = "active"
+    if related_bucket is None:
+        related_bucket = ""
+    if weight is None:
+        weight = 0.5
+    if why_remembered is None:
+        why_remembered = ""
+    try:
+        parsed_weight = float(weight)
+    except (TypeError, ValueError, OverflowError):
+        parsed_weight = 0.5
+    if not math.isfinite(parsed_weight):
+        parsed_weight = 0.5
+    weight = max(0.0, min(1.0, parsed_weight))
     why_remembered = str(why_remembered).strip()[:500]
     await rt.decay_engine.ensure_started()
     if not content or not content.strip():
         return "内容为空，无法登记计划。"
+    size_err = check_content_size(content)
+    if size_err:
+        return size_err
+    metadata_err = check_metadata_size(
+        status=status,
+        related_bucket=related_bucket,
+        why_remembered=why_remembered,
+    )
+    if metadata_err:
+        return metadata_err
     status = status.strip().lower()
     if status not in ("active", "resolved", "abandoned"):
         status = "active"
@@ -86,10 +113,8 @@ async def plan_create(
         await rt.bucket_mgr.update(bucket_id, **update_kwargs)
     except Exception as e:
         rt.logger.warning(f"plan() failed to set status/related: {e}")
-    try:
-        await rt.embedding_engine.generate_and_store(bucket_id, content)
-    except Exception:
-        pass
+    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
+    # 向量，这里不需要也不应该重复调用 generate_and_store（见 hold/feel.py 同类注释）。
     return f"📋plan→{bucket_id} [{status}]"
 
 
@@ -101,15 +126,30 @@ async def letter_write(
     date: Optional[str] = "",
     ai_name: Optional[str] = "",
 ) -> str:
-    if user_name is None: user_name = ""
-    if title is None: title = ""
-    if date is None: date = ""
+    if user_name is None:
+        user_name = ""
+    if title is None:
+        title = ""
+    if date is None:
+        date = ""
     # ai_name：显式传入优先，否则取环境变量 AI_NAME（回退 "AI"）。
     ai = (ai_name or "").strip() or get_ai_name()
     if not author or not author.strip():
         return "author 不能为空。"
     if not content or not content.strip():
         return "信件内容不能为空。"
+    size_err = check_content_size(content)
+    if size_err:
+        return size_err
+    metadata_err = check_metadata_size(
+        author=author,
+        user_name=user_name,
+        title=title,
+        date=date,
+        ai_name=ai_name,
+    )
+    if metadata_err:
+        return metadata_err
 
     # 署名归一化：
     #   - "user" → 用户侧，存 "user"（用户名另存 user_name，逻辑不变）
@@ -147,10 +187,8 @@ async def letter_write(
         await rt.bucket_mgr.update(bucket_id, **extra_meta)
     except Exception as e:
         rt.logger.warning(f"letter_write update meta failed: {e}")
-    try:
-        await rt.embedding_engine.generate_and_store(bucket_id, content)
-    except Exception:
-        pass
+    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
+    # 向量，这里不需要也不应该重复调用 generate_and_store。
     return f"💌letter→{bucket_id} [{a}]"
 
 
@@ -161,12 +199,30 @@ async def letter_read(
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
 ) -> str:
-    if query is None: query = ""
-    if limit is None: limit = 10
-    if author is None: author = ""
-    if date_from is None: date_from = ""
-    if date_to is None: date_to = ""
-    limit = max(1, min(50, limit))
+    if query is None:
+        query = ""
+    if limit is None:
+        limit = 10
+    if author is None:
+        author = ""
+    if date_from is None:
+        date_from = ""
+    if date_to is None:
+        date_to = ""
+    query_err = check_query_size(query)
+    if query_err:
+        return query_err
+    metadata_err = check_metadata_size(
+        author=author,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    if metadata_err:
+        return metadata_err
+    try:
+        limit = max(1, min(50, int(limit)))
+    except (TypeError, ValueError, OverflowError):
+        limit = 10
     try:
         all_b = await rt.bucket_mgr.list_all(include_archive=False)
     except Exception as e:
@@ -188,8 +244,10 @@ async def letter_read(
 
     def _within(b):
         d = b["metadata"].get("letter_date") or b["metadata"].get("created", "")
-        if date_from and d and d < date_from: return False
-        if date_to and d and d > date_to: return False
+        if date_from and d and d < date_from:
+            return False
+        if date_to and d and d > date_to:
+            return False
         return True
 
     letters = [b for b in letters if _within(b)]
@@ -238,8 +296,13 @@ async def letter_read(
         a = m.get("author", "?")
         d = (m.get("letter_date") or m.get("created", ""))[:10]
         title = m.get("title") or m.get("name", "")
-        parts.append(
+        payload = (
             f"[{b['id']}] {a} · {d}{(' · ' + title) if title else ''}\n"
             + strip_wikilinks(b["content"])
+        )
+        parts.append(
+            stored_data_marker(payload, provenance=f"letter:{b['id']}")
+            + "\n"
+            + payload
         )
     return "=== 信件 ===\n" + "\n\n---\n\n".join(parts)

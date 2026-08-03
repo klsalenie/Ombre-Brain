@@ -3,8 +3,12 @@ services:
     name: ombre-brain
     env: python
     region: oregon
-    plan: free
-    buildCommand: pip install -r requirements.txt
+    # Persistent disks require a paid service.  Starter is the minimum Render
+    # plan supported by this Blueprint (512 MiB RAM).
+    plan: starter
+    # Keep Render installs reproducible and aligned with Docker/CI.  The lock
+    # file pins every transitive dependency and includes artifact hashes.
+    buildCommand: pip install --require-hashes -r requirements.lock.txt
     startCommand: python src/server.py
     envVars:
       - key: OMBRE_TRANSPORT
@@ -23,9 +27,15 @@ services:
         sync: false          # e.g. https://generativelanguage.googleapis.com/v1beta/openai/
       - key: OMBRE_COMPRESS_MODEL
         sync: false          # e.g. gemini-2.5-flash
+      # Render services are public as soon as they boot.  Generate a secret at
+      # provisioning time so an anonymous first request cannot claim setup.
+      - key: OMBRE_DASHBOARD_PASSWORD
+        generateValue: true
       - key: OMBRE_BUCKETS_DIR
         value: /opt/render/project/src/buckets
+      - key: OMBRE_CONFIG_PATH
+        value: /opt/render/project/src/buckets/config.yaml
     disk:
       name: ombre-buckets
       mountPath: /opt/render/project/src/buckets
-      sizeGB: 5              # bge-m3 model ~2.2GB + buckets; free plan only has 1GB, upgrade needed
+      sizeGB: 5              # Bucket data + derived embedding index; local bge-m3 is not run on Render

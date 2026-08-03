@@ -9,6 +9,7 @@ dream 的第一步：从全量桶里筛出「过去 window_hours 内有变动的
 
 关键行为：
 - 排除 permanent / feel / plan / letter / pinned / protected
+- 排除 digested / dont_surface / anchor，避免已消化或主动隐藏的桶再次进入梦境
 - 任一 last_active 或 created 在窗口内即纳入
 - 默认按 last_active 倒序，让最新的修改排前面
 - 软上限 40，超了就改按 decay_engine 权重排序后截断
@@ -23,18 +24,55 @@ dream 的第一步：从全量桶里筛出「过去 window_hours 内有变动的
 
 from datetime import datetime, timedelta
 
+from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
+from utils import parse_iso_datetime
 
 DREAM_MAX_CANDIDATES = 40
+_SURFACE_POLICY = SurfacePolicyVM.default()
+
+
+def _can_dream(bucket: dict) -> bool:
+    return _SURFACE_POLICY.evaluate_bucket(bucket, mode="dream").allowed
+
+
+def _metadata_timestamp(meta: dict) -> float:
+    value = meta.get("last_active") or meta.get("created", "")
+    try:
+        return parse_iso_datetime(value).timestamp()
+    except (ValueError, TypeError, OSError):
+        return 0.0
+
+
+def collect_core_context(all_buckets: list) -> list:
+    core = [
+        b for b in all_buckets
+        if (
+            b["metadata"].get("pinned", False)
+            or b["metadata"].get("protected", False)
+            or b["metadata"].get("type") == "permanent"
+        )
+        and _can_dream(b)
+        and b["metadata"].get("type") not in ("letter", "self", "i")
+    ]
+    core.sort(
+        key=lambda b: (
+            int(b["metadata"].get("importance") or 0),
+            _metadata_timestamp(b["metadata"]),
+            b.get("id", ""),
+        ),
+        reverse=True,
+    )
+    return core[:20]
 
 
 def collect_candidates(all_buckets: list, window_hours: int) -> list:
     candidates = [
         b for b in all_buckets
         if b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self", "i")
+        and _can_dream(b)
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
-        and not b["metadata"].get("dont_surface", False)
     ]
     cutoff = datetime.now() - timedelta(hours=window_hours)
 
@@ -44,17 +82,14 @@ def collect_candidates(all_buckets: list, window_hours: int) -> list:
             if not ts:
                 continue
             try:
-                if datetime.fromisoformat(str(ts)) >= cutoff:
+                if parse_iso_datetime(ts) >= cutoff:
                     return True
             except (ValueError, TypeError):
                 continue
         return False
 
     recent = [b for b in candidates if _within_window(b["metadata"])]
-    recent.sort(
-        key=lambda b: b["metadata"].get("last_active") or b["metadata"].get("created", ""),
-        reverse=True,
-    )
+    recent.sort(key=lambda b: _metadata_timestamp(b["metadata"]), reverse=True)
     if len(recent) > DREAM_MAX_CANDIDATES:
         recent.sort(
             key=lambda b: rt.decay_engine.calculate_score(b["metadata"]),

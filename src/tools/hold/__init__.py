@@ -17,14 +17,20 @@ core（普通存入 + 自动合并）。
 - 不返回结构化数据，统一返回供模型阅读的中文短句
 
 对外暴露：dispatch(content, tags, importance, pinned, feel, source_bucket,
-                   valence, arousal, why_remembered) → str
+                   valence, arousal, why_remembered, meaning, media) → str
 ========================================
 """
 
 from typing import Optional
 
+from utils import normalize_memory_title, parse_bool
+
 from .. import _runtime as rt
-from .._common import check_content_size, enforce_high_importance_quota, enforce_pinned_quota
+from .._common import (
+    check_content_size,
+    check_metadata_size,
+    enforce_pinned_quota,
+)
 from .feel import store_feel
 from .pinned import store_pinned
 from .core import store_core
@@ -32,6 +38,7 @@ from .core import store_core
 
 async def dispatch(
     content: str,
+    title: Optional[str] = "",
     tags: Optional[str] = "",
     importance: Optional[int] = 5,
     pinned: Optional[bool] = False,
@@ -40,18 +47,73 @@ async def dispatch(
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
+    meaning: Optional[str] = "",
+    media: Optional[list | str] = None,
+    test_data: Optional[bool] = False,
 ) -> str:
-    if tags is None: tags = ""
-    if importance is None: importance = 5
-    if pinned is None: pinned = False
-    if feel is None: feel = False
-    if source_bucket is None: source_bucket = ""
-    if valence is None: valence = -1
-    if arousal is None: arousal = -1
-    if why_remembered is None: why_remembered = ""
+    content = "" if content is None else str(content)
+    try:
+        title = normalize_memory_title(title)
+    except ValueError as exc:
+        return str(exc)
+    if tags is None:
+        tags = ""
+    if importance is None:
+        importance = 5
+    if pinned is None:
+        pinned = False
+    if feel is None:
+        feel = False
+    if source_bucket is None:
+        source_bucket = ""
+    if valence is None:
+        valence = -1
+    if arousal is None:
+        arousal = -1
+    if why_remembered is None:
+        why_remembered = ""
     why_remembered = str(why_remembered).strip()[:500]
+    if meaning is None:
+        meaning = ""
+    meaning = str(meaning).strip()
+    test_data = parse_bool(test_data, default=False)
+    if test_data and (pinned or feel):
+        return "测试数据不能创建为 pinned 或 feel；请使用普通测试桶。"
+    try:
+        importance = int(importance)
+    except (TypeError, ValueError, OverflowError):
+        importance = 5
+    try:
+        valence = float(valence)
+    except (TypeError, ValueError, OverflowError):
+        valence = -1
+    try:
+        arousal = float(arousal)
+    except (TypeError, ValueError, OverflowError):
+        arousal = -1
+
+    metadata_err = check_metadata_size(
+        tags=tags,
+        title=title,
+        source_bucket=source_bucket,
+        why_remembered=why_remembered,
+        meaning=meaning,
+    )
+    if metadata_err:
+        return metadata_err
     if rt.mark_op:
         rt.mark_op("hold")
+    rt.record_v3_tool_event("hold", {
+        "content_length": len(content or ""),
+        "tags": tags,
+        "importance": importance,
+        "pinned": pinned,
+        "feel": feel,
+        "source_bucket": source_bucket,
+        "valence": valence,
+        "arousal": arousal,
+        "why_remembered_length": len(why_remembered or ""),
+    })
     await rt.decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -69,9 +131,8 @@ async def dispatch(
     if pinned and not feel:
         pinned = await enforce_pinned_quota(True)
 
-    # importance≥9 配额检查（OB-W003 软警告 / OB-I001 自动降级）
-    if not pinned and not feel:
-        importance = await enforce_high_importance_quota(importance)
+    # 普通桶的 importance 配额在 merge_or_create 的最终 merge/create
+    # 事务内检查；这里预检查会在“合并到已占位桶”时产生假降级提示。
 
     # valence/arousal 越界回退到自动打标（OB-W002 由 bucket_manager 在 clamp 时 push；
     # 这里的 -1 咨兵语义是"她/他未传"，越界则忽略，让 LLM analyze 决定）
@@ -106,33 +167,43 @@ async def dispatch(
 
     if feel:
         if not source_bucket or not source_bucket.strip():
-            return "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 breath(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
+            return "feel 必须指向一条原始记忆（source_bucket 不能为空）。请先用 breath_search(query=...) 找到那条桶的 bucket_id，再传入 source_bucket=id。"
         result = await store_feel(
             content=content,
+            title=title,
             extra_tags=extra_tags,
             valence=valence,
             arousal=arousal,
             source_bucket=source_bucket,
             why_remembered=why_remembered,
+            meaning=meaning,
+            media=media,
         )
         return result
 
     if pinned:
         result = await store_pinned(
             content=content,
+            title=title,
             extra_tags=extra_tags,
             valence=valence,
             arousal=arousal,
             why_remembered=why_remembered,
+            meaning=meaning,
+            media=media,
         )
         return result
 
     result = await store_core(
         content=content,
+        title=title,
         extra_tags=extra_tags,
         importance=importance,
         valence=valence,
         arousal=arousal,
         why_remembered=why_remembered,
+        meaning=meaning,
+        media=media,
+        test_data=test_data,
     )
     return result

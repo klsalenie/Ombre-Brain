@@ -3,15 +3,18 @@
 web/embedding.py — 向量化后端摘要 / 迁移重算 / 本地 Ollama 模型管理
 ========================================
 - /api/embedding/info、/api/embedding/migrate(+status)、/api/embedding/local/*
-- 迁移成功后热替换 sh.embedding_engine + sh.bucket_mgr/sh.import_engine 引用，全局一致。
+- 迁移成功后通过共享发布函数热替换所有 embedding 运行时引用，全局一致。
 对外暴露：register(mcp)。
 ========================================
 """
 
+import asyncio
+import contextvars
+import functools
 import os
 import httpx
 import json as _json_lib
-import yaml
+import threading
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -31,21 +34,25 @@ def _persist_embedding_yaml(updates: dict) -> None:
 
     迁移完成后必须调用：否则切到本地/云端只改了进程内 sh.config，重启后 config.yaml
     还是旧的 → 与 embeddings.db 里已重算的向量维度不一致 → OB-W005 / 检索失效。
+    走 utils.atomic_update_config_yaml（加锁 + 原子写 + 读回校验），不再是
+    「open(w) 整份覆盖、失败只 logger.error」——半份写坏或和其它保存接口并发写
+    互相覆盖，都会让这里辛苦写的 dim/backend 悄悄丢回旧值，正是 OB-W005 反复复发的成因。
     """
     try:
-        from utils import config_file_path
-        _cfg_path = config_file_path()
-        _save: dict = {}
-        if os.path.exists(_cfg_path):
-            with open(_cfg_path, "r", encoding="utf-8") as _f:
-                _save = yaml.safe_load(_f) or {}
-        _sec = _save.setdefault("embedding", {})
-        for k, v in updates.items():
-            _sec[k] = v
-        with open(_cfg_path, "w", encoding="utf-8") as _f:
-            yaml.dump(_save, _f, allow_unicode=True, default_flow_style=False)
-    except Exception as e:
-        logger.error(f"[migration] persist embedding to config.yaml failed: {e}")
+        from utils import atomic_update_config_yaml
+    except ImportError:  # pragma: no cover - 包模式
+        from ..utils import atomic_update_config_yaml
+
+    def _mutate(save_config: dict) -> None:
+        sec = save_config.setdefault("embedding", {})
+        if not isinstance(sec, dict):
+            sec = {}
+            save_config["embedding"] = sec
+        sec.update(updates)
+
+    # 写失败必须传播给迁移状态机。静默记录后返回会让已失败的配置发布被标记为
+    # completed，用户随后重启才发现仍在使用旧模型。
+    atomic_update_config_yaml(_mutate)
 
 
 _DEFAULT_OLLAMA_BASE = "http://ombre-ollama:11434"
@@ -57,14 +64,136 @@ _OLLAMA_MIRRORS = {
 
 _ollama_pull_state: dict = {"running": False, "model": "", "percent": 0, "status": "idle", "error": ""}
 _ollama_pull_task: "asyncio.Task | None" = None  # 持有引用防止被 GC
+_ollama_pull_lock = threading.Lock()
+_ollama_pull_owner_guard = threading.Lock()
+_ollama_pull_owner: object | None = None
+_ollama_pull_request_state: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("ombre_ollama_pull_request_state", default=None)
+)
+_migration_request_state: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("ombre_embedding_migration_request_state", default=None)
+)
+
+
+def _reserve_ollama_pull() -> object | None:
+    """Atomically reserve the one process-wide Ollama pull slot."""
+
+    global _ollama_pull_owner
+    if not _ollama_pull_lock.acquire(blocking=False):
+        return None
+    owner = object()
+    with _ollama_pull_owner_guard:
+        _ollama_pull_owner = owner
+    return owner
+
+
+def _owns_ollama_pull(owner: object) -> bool:
+    with _ollama_pull_owner_guard:
+        return _ollama_pull_owner is owner
+
+
+def _release_ollama_pull(owner: object) -> bool:
+    global _ollama_pull_owner
+    with _ollama_pull_owner_guard:
+        if _ollama_pull_owner is not owner:
+            return False
+        _ollama_pull_owner = None
+        _ollama_pull_lock.release()
+    return True
+
+
+def _with_migration_reservation(handler):
+    """Reserve migration ownership before the route's first await.
+
+    The reservation remains request-owned during target construction, stale
+    staging cleanup, provider probing, and outbox shutdown.  Once the worker is
+    created, ``start_migration`` owns the same token until its ``finally``.
+    """
+
+    @functools.wraps(handler)
+    async def _wrapped(request: Request) -> Response:
+        from starlette.responses import JSONResponse
+
+        err = sh._require_auth(request)
+        if err:
+            return err
+        try:
+            from migration_engine import (  # type: ignore
+                release_migration_reservation,
+                reserve_migration,
+            )
+        except ImportError:
+            from ..migration_engine import (
+                release_migration_reservation,
+                reserve_migration,
+            )
+
+        reservation = reserve_migration()
+        if reservation is None:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "另一个迁移任务正在进行；请稍后再试或等其完成",
+                },
+                status_code=409,
+            )
+
+        state = {"reservation": reservation, "transferred": False}
+        context_token = _migration_request_state.set(state)
+        try:
+            return await handler(request)
+        finally:
+            _migration_request_state.reset(context_token)
+            if not state["transferred"]:
+                release_migration_reservation(reservation)
+
+    return _wrapped
+
+
+def _with_ollama_pull_reservation(handler):
+    """Reserve the Ollama pull slot before parsing the request body."""
+
+    @functools.wraps(handler)
+    async def _wrapped(request: Request) -> Response:
+        from starlette.responses import JSONResponse
+
+        err = sh._require_auth(request)
+        if err:
+            return err
+        owner = _reserve_ollama_pull()
+        if owner is None:
+            return JSONResponse(
+                {"ok": False, "error": "已有拉取任务在进行中"},
+                status_code=409,
+            )
+
+        global _ollama_pull_state
+        _ollama_pull_state = {
+            "running": True,
+            "model": "",
+            "percent": 0,
+            "status": "validating",
+            "error": "",
+        }
+        state = {"owner": owner, "transferred": False}
+        context_token = _ollama_pull_request_state.set(state)
+        try:
+            return await handler(request)
+        finally:
+            _ollama_pull_request_state.reset(context_token)
+            if not state["transferred"] and _owns_ollama_pull(owner):
+                _ollama_pull_state["running"] = False
+                _release_ollama_pull(owner)
+
+    return _wrapped
 
 # --- backfill（只补缺失向量，区别于 migrate 全库重算）---
-# 用途：v2.2 前建的桶（尤其 permanent）落盘时没走 create() 内置 _sync_embedding，
+# 用途：v2.2 前建的桶（尤其 permanent）可能没有向量，
 # embeddings.db 里没有它们的行 → breath 语义检索查不到。migrate 能修但会重算全库、
 # 浪费 API 额度；backfill 只给「文件在、向量缺」的桶补一发，幂等、便宜。
 _backfill_state: dict = {
     "running": False, "scanned": 0, "missing": 0, "done": 0,
-    "failed": 0, "status": "idle", "error": "",
+    "failed": 0, "queued": 0, "status": "idle", "error": "",
 }
 _backfill_task: "asyncio.Task | None" = None  # 持有引用防止被 GC
 
@@ -82,13 +211,25 @@ def _ollama_base() -> str:
     return raw.rstrip("/").removesuffix("/v1").rstrip("/")
 
 
-async def _ollama_pull_run(ollama_url: str, name: str) -> None:
+async def _ollama_pull_run(
+    ollama_url: str,
+    name: str,
+    *,
+    reservation: object | None = None,
+) -> None:
     """后台流式拉模型，进度写入 _ollama_pull_state。"""
     global _ollama_pull_state
+    owner = reservation or _reserve_ollama_pull()
+    if owner is None or not _owns_ollama_pull(owner):
+        logger.info("[ollama] another model pull already owns the slot; skip")
+        return
     _ollama_pull_state = {"running": True, "model": name, "percent": 0, "status": "starting", "error": ""}
     try:
         # trust_env=False：本地/容器 ollama 不走系统代理（否则 Clash/V2Ray 开着会 502）
-        async with httpx.AsyncClient(timeout=None, trust_env=False) as c:
+        # Model pulls are long-running streams, so the read phase stays
+        # unbounded while connect/write/pool waits remain finite.
+        timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as c:
             async with c.stream("POST", f"{ollama_url}/api/pull", json={"name": name, "stream": True}) as r:
                 if r.status_code != 200:
                     raw = await r.aread()
@@ -117,8 +258,15 @@ async def _ollama_pull_run(ollama_url: str, name: str) -> None:
                         _ollama_pull_state.update(running=False, status="success", percent=100)
                         return
         _ollama_pull_state["running"] = False
+    except asyncio.CancelledError:
+        _ollama_pull_state.update(running=False, status="cancelled")
+        raise
     except Exception as e:
         _ollama_pull_state.update(running=False, status="error", error=str(e)[:200])
+    finally:
+        if _owns_ollama_pull(owner):
+            _ollama_pull_state["running"] = False
+            _release_ollama_pull(owner)
 
 
 async def _backfill_run() -> None:
@@ -132,6 +280,68 @@ async def _backfill_run() -> None:
     try:
         all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
         _backfill_state["scanned"] = len(all_buckets)
+        for key in ("orphaned", "cleaned", "cleanup_failed"):
+            _backfill_state.setdefault(key, 0)
+
+        # Reconcile both sides of the derived index.  Historically this action
+        # only queued "bucket exists, vector missing" rows, while diagnostics
+        # also reported the opposite drift (vector exists, bucket missing).
+        # That made the Dashboard recommend backfill for orphan vectors and
+        # then report "pending 0 / queued 0" forever.
+        known_ids = {
+            str(bucket.get("id") or "")
+            for bucket in all_buckets
+            if str(bucket.get("id") or "")
+        }
+        try:
+            indexed_ids = set(engine.list_all_ids()) if engine else set()
+        except Exception as exc:
+            logger.warning("[backfill] could not list indexed ids: %s", exc)
+            indexed_ids = set()
+        orphan_candidates = sorted(indexed_ids - known_ids)
+        orphan_ids: list[str] = []
+        for bucket_id in orphan_candidates:
+            try:
+                # ``all_buckets`` is only a snapshot. A concurrent hold may
+                # publish and index a new bucket after that scan; never delete
+                # its vector without confirming the Markdown is still absent.
+                if await sh.bucket_mgr.get(bucket_id) is not None:
+                    continue
+                orphan_ids.append(bucket_id)
+            except Exception as exc:
+                _backfill_state["cleanup_failed"] += 1
+                logger.warning(
+                    "[backfill] orphan confirmation failed for %s: %s",
+                    bucket_id,
+                    exc,
+                )
+        _backfill_state["orphaned"] = len(orphan_ids)
+        for bucket_id in orphan_ids:
+            try:
+                engine.delete_embedding(bucket_id)
+                _backfill_state["cleaned"] += 1
+            except Exception as exc:
+                _backfill_state["cleanup_failed"] += 1
+                logger.warning("[backfill] orphan cleanup failed for %s: %s", bucket_id, exc)
+
+        # Managed server runtimes have one durable writer for the derived
+        # index. Reuse it so manual backfill, startup reconciliation, and
+        # decay self-healing cannot race each other or bypass retry state.
+        outbox = sh.embedding_outbox
+        if outbox is not None and getattr(outbox, "running", False):
+            queued = await outbox.reconcile(
+                buckets=all_buckets,
+                include_archive=True,
+            )
+            outbox.retry_now()
+            queue_state = outbox.status()
+            _backfill_state.update(
+                missing=queue_state["pending"],
+                failed=queue_state["retrying"],
+                queued=queued,
+                status="queued",
+            )
+            return
 
         # 先扫出缺向量的桶（空内容的跳过——没法向量化）
         missing: list[tuple[str, str]] = []
@@ -183,12 +393,18 @@ def register(mcp) -> None:
         info: dict[str, object] = {
             "ok": True,
             "backend": getattr(sh.embedding_engine, "backend", ""),
+            "api_format": getattr(sh.embedding_engine, "api_format", ""),
             "enabled": bool(getattr(sh.embedding_engine, "enabled", False)),
             "model": backend_obj.model_name() if backend_obj else "",
             "vector_dim": backend_obj.vector_dim() if backend_obj else 0,
             "db_path": getattr(sh.embedding_engine, "db_path", ""),
             "db_count": 0,
             "db_meta": {},
+            "outbox": (
+                sh.embedding_outbox.status()
+                if sh.embedding_outbox is not None
+                else None
+            ),
         }
         # 主表行数
         try:
@@ -210,6 +426,7 @@ def register(mcp) -> None:
         return JSONResponse(info)
 
     @mcp.custom_route("/api/embedding/migrate", methods=["POST"])
+    @_with_migration_reservation
     async def api_embedding_migrate(request: Request) -> Response:
         """启动后台迁移任务：用目标后端重算所有 bucket 的 embedding。
 
@@ -224,15 +441,19 @@ def register(mcp) -> None:
         已有任务在跑返回 409。
         """
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
-        if err:
-            return err
 
         try:
-            body = await request.json()
+            body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"ok": False, "error": "invalid JSON"}, status_code=400)
 
+        migration_fields = (
+            "target_backend", "api_format", "api_key", "base_url", "model"
+        )
+        if any(key in body and not isinstance(body[key], str) for key in migration_fields):
+            return JSONResponse({"ok": False, "error": "migration fields must be strings"}, status_code=400)
+        if any(len(body.get(key, "")) > 8192 for key in migration_fields):
+            return JSONResponse({"ok": False, "error": "migration field is too large"}, status_code=400)
         target_backend_raw = str(body.get("target_backend", "")).strip().lower()
         # local/ollama 底层也是 openai_compat（backend=api），用 api_format 区分云端/本地
         target_backend = "api" if target_backend_raw in ("api", "gemini", "local", "ollama", "") else target_backend_raw
@@ -252,20 +473,16 @@ def register(mcp) -> None:
 
         try:
             from migration_engine import (  # type: ignore
-                MigrationConfig, start_migration, is_running,
+                MigrationConfig, start_migration,
                 status_path_for as _mig_status_path_for,
+                staging_db_path_for, reset_stale_migration_state, target_signature,
             )
         except ImportError:
-            from .migration_engine import (  # type: ignore
-                MigrationConfig, start_migration, is_running,
+            from ..migration_engine import (  # type: ignore
+                MigrationConfig, start_migration,
                 status_path_for as _mig_status_path_for,
+                staging_db_path_for, reset_stale_migration_state, target_signature,
             )
-
-        if is_running():
-            return JSONResponse({
-                "ok": False,
-                "error": "另一个迁移任务正在进行；请稍后再试或等其完成",
-            }, status_code=409)
 
         # 构造目标引擎（不替换 global，跑完才替）
         target_cfg = _json_lib.loads(_json_lib.dumps(sh.config))  # 深拷贝
@@ -276,15 +493,24 @@ def register(mcp) -> None:
             target_emb_cfg["api_format"] = req_api_format
         if body.get("api_key"):
             target_emb_cfg["api_key"] = str(body["api_key"]).strip()
-        if body.get("base_url"):
+        # Field presence and truthiness are different here: switching from a
+        # cloud provider to Ollama deliberately sends an empty base_url so the
+        # old cloud endpoint is cleared and the local default can take over.
+        if "base_url" in body:
             target_emb_cfg["base_url"] = str(body["base_url"]).strip()
         if body.get("model"):
             target_emb_cfg["model"] = str(body["model"]).strip()
 
+        # 迁移过程只写这个 staging db，绝不碰 live db，直到全部成功才原子替换
+        # （见 migration_engine.py 的 _run_migration）。
+        _live_db_path = getattr(sh.embedding_engine, "db_path", "") or os.path.join(
+            sh.config.get("buckets_dir", "buckets"), "embeddings.db"
+        )
         try:
             from embedding_engine import EmbeddingEngine  # type: ignore
         except ImportError:
             from ..embedding_engine import EmbeddingEngine  # type: ignore
+        target_emb_cfg["db_path"] = staging_db_path_for(_live_db_path)
         try:
             target_engine = EmbeddingEngine(target_cfg)
         except OBStartupError as oe:
@@ -299,6 +525,23 @@ def register(mcp) -> None:
             }, status_code=400)
 
         target_backend_obj = getattr(target_engine, "_backend", None)
+
+        # 目标签名（真正解析出来的 model/dim，不是请求里可能留空的原始参数）
+        # 跟上次不一致，说明 staging db 里如果有残留向量是另一个模型留下的，
+        # checkpoint 记的 done_ids 同样作废——必须先清掉再继续，否则断点续传
+        # 会把不兼容的旧向量当成「这个新目标已经完成」，直接原子替换进主库。
+        # _init_db() 是幂等的 CREATE TABLE IF NOT EXISTS，清空后必须重跑一次，
+        # 否则 target_engine 后续 sqlite3.connect() 会在空文件上直接建表失败。
+        if target_backend_obj is not None:
+            _signature = target_signature(
+                target_backend,
+                target_backend_obj.model_name(),
+                target_backend_obj.vector_dim(),
+            )
+            reset_stale_migration_state(
+                sh.config.get("buckets_dir", "buckets"), _live_db_path, _signature
+            )
+            target_engine._init_db()
 
         # 预检（fail-fast）：先用目标引擎试嵌入一小段，确认后端真的可用，
         # 再决定要不要启动全库重算。否则切到本地但 bge-m3 没下载 / ollama 没起，
@@ -341,22 +584,27 @@ def register(mcp) -> None:
             fetch_buckets=_fetch_buckets,
         )
 
-        def _on_complete(success: bool) -> None:
-            if not success:
-                logger.warning("[migration] task finished with failures; sh.embedding_engine NOT swapped")
+        outbox = sh.embedding_outbox
+        outbox_was_running = bool(
+            outbox is not None and getattr(outbox, "running", False)
+        )
+
+        def _restart_outbox() -> None:
+            if not outbox_was_running or outbox is None:
                 return
-            # 成功 → 把 global engine 切到目标
             try:
-                sh.embedding_engine = target_engine
-                # bucket_mgr / import_engine 持有的引用更新
-                try:
-                    sh.bucket_mgr.embedding_engine = target_engine
-                except Exception:
-                    pass
-                try:
-                    sh.import_engine.embedding_engine = target_engine
-                except Exception:
-                    pass
+                import asyncio as _aio
+                _aio.create_task(outbox.start(reconcile=True))
+            except Exception as e:
+                logger.error(f"[migration] embedding outbox restart failed: {e}")
+
+        def _on_complete(success: bool) -> None:
+            try:
+                if not success:
+                    logger.warning("[migration] task finished with failures; sh.embedding_engine NOT swapped")
+                    return
+                # 成功 → 把 global engine 切到目标
+                sh.replace_embedding_engine(target_engine)
                 # 持久化到 config（进程内 + config.yaml，重启/重建不丢）
                 cfg_emb = sh.config.setdefault("embedding", {})
                 cfg_emb["backend"] = target_backend
@@ -377,7 +625,7 @@ def register(mcp) -> None:
                 if body.get("api_key"):
                     cfg_emb["api_key"] = str(body["api_key"]).strip()
                     _yaml_updates["api_key"] = str(body["api_key"]).strip()
-                if body.get("base_url"):
+                if "base_url" in body:
                     cfg_emb["base_url"] = str(body["base_url"]).strip()
                     _yaml_updates["base_url"] = str(body["base_url"]).strip()
                 if body.get("model"):
@@ -387,13 +635,35 @@ def register(mcp) -> None:
                 logger.info(f"[migration] sh.embedding_engine swapped to backend={target_backend} format={req_api_format or '(unchanged)'}; persisted to config.yaml")
             except Exception as e:
                 logger.error(f"[migration] post-swap failed: {e}")
+                raise
+            finally:
+                _restart_outbox()
 
-        task = start_migration(mig_cfg, on_complete=_on_complete)
+        # Migration rewrites the same SQLite index. Stop the normal queue
+        # worker for the migration window, then restart it in the callback.
+        request_state = _migration_request_state.get()
+        if request_state is None:  # pragma: no cover - decorator invariant
+            raise RuntimeError("migration route lost its reservation")
+        try:
+            if outbox_was_running:
+                await outbox.stop()
+            task = start_migration(
+                mig_cfg,
+                on_complete=_on_complete,
+                reservation=request_state["reservation"],
+            )
+        except BaseException:
+            # A request cancellation during ``outbox.stop()`` must not leave
+            # the normal index writer disabled after the reservation unwinds.
+            _restart_outbox()
+            raise
         if task is None:
+            _restart_outbox()
             return JSONResponse({
                 "ok": False,
                 "error": "无法启动迁移任务（锁未获得）",
             }, status_code=409)
+        request_state["transferred"] = True
 
         return JSONResponse({
             "ok": True,
@@ -415,7 +685,7 @@ def register(mcp) -> None:
                 is_running,
             )
         except ImportError:
-            from .migration_engine import (  # type: ignore
+            from ..migration_engine import (  # type: ignore
                 status_path_for as _mig_status_path_for,
                 read_status as _mig_read_status,
                 is_running,
@@ -441,7 +711,11 @@ def register(mcp) -> None:
             return err
 
         engine = sh.embedding_engine
-        if not engine or not getattr(engine, "enabled", False):
+        managed_outbox = bool(
+            sh.embedding_outbox is not None
+            and getattr(sh.embedding_outbox, "running", False)
+        )
+        if (not engine or not getattr(engine, "enabled", False)) and not managed_outbox:
             return JSONResponse({
                 "ok": False,
                 "error": "向量化未启用（缺 key / 本地模型未就绪），无法补齐。",
@@ -452,7 +726,7 @@ def register(mcp) -> None:
             from migration_engine import is_running as _mig_running  # type: ignore
         except ImportError:
             try:
-                from .migration_engine import is_running as _mig_running  # type: ignore
+                from ..migration_engine import is_running as _mig_running  # type: ignore
             except Exception:
                 _mig_running = lambda: False  # noqa: E731
         if _mig_running():
@@ -468,7 +742,8 @@ def register(mcp) -> None:
         import asyncio as _aio
         _backfill_state = {
             "running": True, "scanned": 0, "missing": 0, "done": 0,
-            "failed": 0, "status": "scanning", "error": "",
+            "failed": 0, "queued": 0, "orphaned": 0, "cleaned": 0,
+            "cleanup_failed": 0, "status": "scanning", "error": "",
         }
         _backfill_task = _aio.create_task(_backfill_run())
         return JSONResponse({
@@ -483,7 +758,16 @@ def register(mcp) -> None:
         err = sh._require_auth(request)
         if err:
             return err
-        return JSONResponse({"ok": True, "backfill": _backfill_state})
+        outbox_state = (
+            sh.embedding_outbox.status()
+            if sh.embedding_outbox is not None
+            else None
+        )
+        return JSONResponse({
+            "ok": True,
+            "backfill": _backfill_state,
+            "outbox": outbox_state,
+        })
 
     @mcp.custom_route("/api/embedding/local/status", methods=["GET"])
     async def api_embedding_local_status(request: Request) -> Response:
@@ -510,33 +794,54 @@ def register(mcp) -> None:
         return JSONResponse(out)
 
     @mcp.custom_route("/api/embedding/local/pull", methods=["POST"])
+    @_with_ollama_pull_reservation
     async def api_embedding_local_pull(request: Request) -> Response:
         """触发后台拉模型。body: {model?: 'bge-m3', mirror?: 'official'|'modelscope'|<自定义前缀>}。"""
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
-        if err:
-            return err
-        if _ollama_pull_state.get("running"):
-            return JSONResponse({"ok": False, "error": "已有拉取任务在进行中"}, status_code=409)
         try:
             body = await request.json()
         except Exception:
             body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
+        if any(
+            key in body and not isinstance(body[key], str)
+            for key in ("model", "mirror")
+        ):
+            return JSONResponse({"ok": False, "error": "model and mirror must be strings"}, status_code=400)
         model = (str(body.get("model") or "bge-m3")).strip()
         mirror_raw = (str(body.get("mirror") or "official")).strip()
+        if len(model) > 512 or len(mirror_raw) > 2048:
+            return JSONResponse({"ok": False, "error": "model or mirror is too large"}, status_code=400)
         prefix = _OLLAMA_MIRRORS.get(mirror_raw, mirror_raw if mirror_raw not in ("", "official") else "")
         name = f"{prefix}{model}" if prefix else model
         base = _ollama_base()
+        _ollama_pull_state.update(model=name, status="checking")
         # 可达性预检，避免后台任务静默失败
         try:
             async with httpx.AsyncClient(timeout=5.0, trust_env=False) as c:
                 vr = await c.get(f"{base}/api/version")
                 vr.raise_for_status()
         except Exception as e:
+            _ollama_pull_state.update(
+                running=False,
+                status="error",
+                error=str(e)[:200],
+            )
             return JSONResponse({"ok": False, "error": f"无法连接 ollama（{base}）：{str(e)[:120]}"}, status_code=502)
         import asyncio as _aio
         global _ollama_pull_task
-        _ollama_pull_task = _aio.create_task(_ollama_pull_run(base, name))
+        request_state = _ollama_pull_request_state.get()
+        if request_state is None:  # pragma: no cover - decorator invariant
+            raise RuntimeError("Ollama pull route lost its reservation")
+        _ollama_pull_task = _aio.create_task(
+            _ollama_pull_run(
+                base,
+                name,
+                reservation=request_state["owner"],
+            )
+        )
+        request_state["transferred"] = True
         return JSONResponse({"ok": True, "started": True, "pulling": name})
 
     @mcp.custom_route("/api/embedding/local/pull/status", methods=["GET"])

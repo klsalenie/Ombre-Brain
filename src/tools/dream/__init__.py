@@ -18,7 +18,7 @@ dispatch() 只负责把这三步串起来。
 from typing import Optional
 
 from .. import _runtime as rt
-from .candidates import collect_candidates
+from .candidates import collect_candidates, collect_core_context
 from .hints import build_connection_hint, build_crystal_hint
 from .output import format_dream_output
 
@@ -34,7 +34,8 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
 
     window_hours = max(1, min(int(window_hours or 48), 24 * 14))
     recent = collect_candidates(all_buckets, window_hours)
-    if not recent:
+    core_context = collect_core_context(all_buckets)
+    if not recent and not core_context:
         return f"过去 {window_hours} 小时内没有需要消化的新记忆。"
 
     connection_hint = await build_connection_hint(recent)
@@ -46,6 +47,7 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
         window_hours=window_hours,
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
+        core_context=core_context,
     )
 
     if rt.fire_webhook:

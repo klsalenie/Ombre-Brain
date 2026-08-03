@@ -11,8 +11,8 @@ bucket_manager.py — 记忆桶的增删改查与多维索引
 - 创建/读取/更新/删除/搬家（move）都在这里
 - 检索 = 先按 domain 预筛，再按情感坐标 + 文本相似度加权排序
 - 情感坐标是 Russell 环形模型的连续值：valence 0~1（消极→积极），arousal 0~1（平静→激动）
-- create()/update(content=...)/delete() 自动同步 embedding 索引（iter 2.1+），
-  避免「文件存在但向量缺失」的孤儿桶导致 breath 检索数对不上 pulse
+- create()/update(content=...) 先落盘再投递 embedding outbox；delete() 清理派生索引
+- 所有记忆类型都以 Markdown 为真源；向量化失败不会回滚原文，由后台统一重试
 - iter 2.0：create() 接受 ``bucket_id_override``（feel 用分钟级可读 id），
   以及 ``source_tool`` / ``grow_batch_id`` 用于来源追踪
 
@@ -28,11 +28,21 @@ bucket_manager.py — 记忆桶的增删改查与多维索引
 
 import os
 import re
-import math
+import asyncio
+import errno
+import hashlib
+import json
 import logging
-import shutil
+import math
+import threading
+import time
+import tempfile
 import uuid
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+
+from ombrebrain.domain.plan_history import append_plan_change_log
+from ombrebrain.eventsourcing.footprint import FootprintSnapshot
 
 # 统一错误体系：越界 clamp 时上报 OB-W001/OB-W002（rule.md §11）
 try:
@@ -45,11 +55,229 @@ except Exception:
             return None
 
 
+class _CrossLoopAsyncLock:
+    """An async mutex that is safe across FastMCP event loops and threads."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    async def __aenter__(self):
+        while not self._lock.acquire(blocking=False):
+            await asyncio.sleep(0.01)
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb) -> None:
+        self._lock.release()
+
+
+@asynccontextmanager
+async def _filesystem_turn(base_dir: str, key: str, timeout_seconds: float = 30.0):
+    """Cross-thread/cross-loop/process mutual exclusion via an OS file lease.
+
+    A plain ``asyncio.Lock`` only serializes tasks scheduled on the same event
+    loop; FastMCP may dispatch requests from different loops/threads (see the
+    identical rationale in tools/_common.py's ``_filesystem_content_turn``), so
+    quota check-then-write sequences (anchor's 24-cap) need an OS-level guard
+    instead of an in-process one.
+
+    The kernel owns the lease for as long as this context keeps its descriptor
+    open.  This has two important properties that an mtime-based lock file does
+    not: a slow live operation can never have its lock stolen after an arbitrary
+    age, while a crashed process releases the lease automatically.  The key is
+    hashed before it becomes a filename, so an untrusted bucket id cannot escape
+    ``.locks`` or create nested paths.
+    """
+    if not base_dir:
+        yield
+        return
+    lock_dir = Path(base_dir) / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_id = hashlib.sha256(str(key).encode("utf-8", errors="surrogatepass")).hexdigest()
+    lock_path = lock_dir / f"{lock_id}.lock"
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    deadline = time.monotonic() + timeout_seconds
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        handle = os.fdopen(descriptor, "r+b", buffering=0)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+    busy_errnos = {
+        errno.EACCES,
+        errno.EAGAIN,
+        getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+    }
+    busy_winerrors = {32, 33}  # Windows 共享冲突 / 锁冲突
+
+    def _is_busy(exc: OSError) -> bool:
+        return (
+            exc.errno in busy_errnos
+            or getattr(exc, "winerror", None) in busy_winerrors
+        )
+
+    def _owner_preview() -> str:
+        try:
+            previous = handle.tell()
+            handle.seek(0)
+            raw = handle.read(1024)
+            handle.seek(previous)
+            preview = raw.decode("ascii", errors="replace").strip("\0\r\n ")
+            return preview[:512] or "empty"
+        except (OSError, ValueError):
+            return "unavailable"
+
+    def _log_non_contention_error(exc: OSError, phase: str) -> None:
+        logger.error(
+            "Filesystem lease %s failed: key=%r lock_id=%s path=%s "
+            "errno=%s winerror=%s owner=%s",
+            phase,
+            key,
+            lock_id,
+            lock_path,
+            exc.errno,
+            getattr(exc, "winerror", None),
+            _owner_preview(),
+        )
+
+    def _try_acquire() -> bool:
+        try:
+            if os.name == "nt":  # pragma: no branch - platform-specific
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - exercised in Linux CI/container
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if _is_busy(exc):
+                return False
+            _log_non_contention_error(exc, "acquire")
+            raise
+
+    def _release() -> None:
+        if os.name == "nt":  # pragma: no branch - platform-specific
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - exercised in Linux CI/container
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    acquired = False
+    try:
+        # Windows 字节范围锁要求目标字节已存在。两个进程可能同时打开刚创建的
+        # 零字节文件，因此初始化必须放在最外层 try 内，确保任务取消也会关闭句柄。
+        while True:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() > 0:
+                break
+            try:
+                handle.write(b"\0")
+                break
+            except OSError as exc:
+                if os.name != "nt" or not _is_busy(exc):
+                    _log_non_contention_error(exc, "initialization")
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "timed out initializing filesystem lease "
+                        f"{lock_id} key={key!r} owner={_owner_preview()}"
+                    )
+                await asyncio.sleep(0.01)
+        handle.seek(0)
+
+        while not acquired:
+            acquired = _try_acquire()
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "timed out waiting for filesystem lease "
+                    f"{lock_id} key={key!r} owner={_owner_preview()}"
+                )
+            await asyncio.sleep(0.01)
+
+        owner = json.dumps(
+            {
+                "state": "held",
+                "token": token,
+                "pid": os.getpid(),
+                "thread": threading.get_ident(),
+                "acquired_at": time.time(),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        handle.seek(0)
+        handle.write(owner)
+        handle.truncate()
+        yield
+    finally:
+        if acquired:
+            try:
+                released = json.dumps(
+                    {
+                        "state": "released",
+                        "token": token,
+                        "pid": os.getpid(),
+                        "released_at": time.time(),
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                handle.seek(0)
+                handle.write(released)
+                handle.truncate()
+            except OSError as exc:
+                logger.warning(
+                    "Filesystem lease release marker failed: key=%r lock_id=%s "
+                    "errno=%s winerror=%s",
+                    key,
+                    lock_id,
+                    exc.errno,
+                    getattr(exc, "winerror", None),
+                )
+            try:
+                _release()
+            except OSError as exc:
+                # 即使显式解锁失败，下面关闭 descriptor 仍是最终释放保障。
+                logger.warning(
+                    "Filesystem lease explicit unlock failed: key=%r lock_id=%s "
+                    "errno=%s winerror=%s",
+                    key,
+                    lock_id,
+                    exc.errno,
+                    getattr(exc, "winerror", None),
+                )
+        try:
+            handle.close()
+        except OSError as exc:
+            logger.warning(
+                "Filesystem lease descriptor close failed: key=%r lock_id=%s "
+                "errno=%s winerror=%s",
+                key,
+                lock_id,
+                exc.errno,
+                getattr(exc, "winerror", None),
+            )
+
+
 def _clamp_importance(v, source: str) -> int:
     """importance 越界 → clamp 到 [1,10]，并产生 OB-W001 提示。"""
     try:
         iv = int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _ob_push_warning("OB-W001", f"importance={v!r} 无法解析，回退为 5（{source}）")
         return 5
     if iv < 1 or iv > 10:
@@ -66,6 +294,9 @@ def _clamp_unit(v, field: str, source: str) -> float:
     except (TypeError, ValueError):
         _ob_push_warning("OB-W002", f"{field}={v!r} 无法解析，回退为 0.5（{source}）")
         return 0.5
+    if not math.isfinite(fv):
+        _ob_push_warning("OB-W002", f"{field}={v!r} 不是有限数，回退为 0.5（{source}）")
+        return 0.5
     if fv < 0.0 or fv > 1.0:
         clamped = max(0.0, min(1.0, fv))
         _ob_push_warning("OB-W002", f"{field}={fv} 超出 [0.0,1.0]，已修正为 {clamped}（{source}）")
@@ -77,9 +308,30 @@ from pathlib import Path
 from typing import Any, Optional
 
 import frontmatter
-from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import (
+    atomic_write_text,
+    generate_bucket_id,
+    sanitize_name,
+    safe_path,
+    now_iso,
+    normalize_memory_title,
+    parse_bool,
+    parse_iso_datetime,
+)
+from ombrebrain.storage.media_store import MediaStore
+from ombrebrain.retrieval.bucket_scoring import (
+    calc_topic_score,
+    calc_emotion_score,
+    calc_time_score,
+    calc_touch_score,
+)
+from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
+from ombrebrain.eventsourcing.ledger_replay import LedgerReplayValidator
+from ombrebrain.projection.projection_mirror import TraceCatalogProjection
+from ombrebrain.projection.projection_sqlite import TraceSQLiteProjection
+from ombrebrain.projection.projection_vector import TraceVectorProjectionManifest
+from ombrebrain.policy.formal_invariants import FormalInvariantChecker
 
 try:
     from bm25_index import BM25Index as _BM25Index
@@ -87,6 +339,38 @@ except ImportError:
     _BM25Index = None  # type: ignore
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+
+_atomic_write_text = atomic_write_text  # Backward-compatible private alias.
+
+
+def _atomic_create_text(path: str, text: str) -> None:
+    """Publish a complete text file atomically, refusing an existing target.
+
+    ``atomic_write_text`` intentionally replaces its destination, which is the
+    right behavior for updates but unsafe for creation races.  Build the full
+    file beside the destination and publish it with a hard link: link creation
+    is atomic and fails with ``FileExistsError`` instead of overwriting.
+    """
+
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.create.",
+        dir=parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, target)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 
 # ============================================================
@@ -102,38 +386,66 @@ _DEFAULT_AROUSAL = 0.3
 _DEFAULT_IMPORTANCE = 5
 _PINNED_IMPORTANCE = 10           # pinned/protected 桶 importance 锁定值
 _DEFAULT_DOMAIN_NAME = "未分类"     # 未提供 domain 时的占位
+_EDITABLE_BUCKET_TYPES = frozenset(
+    {"dynamic", "permanent", "feel", "plan", "letter", "i", "self"}
+)
+_PLAN_STATUSES = frozenset({"active", "resolved", "abandoned"})
 
 # --- 字段截断长度（避免 frontmatter 肨胀）---
 _SOURCE_TOOL_MAX = 32
 _GROW_BATCH_ID_MAX = 64
 _WHY_REMEMBERED_MAX = 500
 _TRIGGERED_BY_MAX = 64
+_DEFAULT_MAX_BUCKET_BYTES = 50 * 1024
+_MAX_TAGS = 64
+_MAX_TAG_CHARS = 128
+_MAX_DOMAINS = 16
+_MAX_DOMAIN_CHARS = 128
+
+# --- Miss：meaning / media（hold 的体验锚定扩展）---
+# meaning 存储为 list[str]：同一条记忆可能在不同时刻被反复触动，每次 hold
+# 传入的是新增的一条，追加到列表，不覆盖已有的（见 tools/_common.py merge_or_create）。
+_MEANING_ITEM_MAX = 2000        # 单条 meaning 的长度上限
+_MEANING_LIST_MAX_ITEMS = 50    # 一个桶最多累积多少条 meaning
+_MEDIA_MAX_ITEMS = 20           # 单条记忆最多关联多少个 media 引用
+_MEDIA_PATH_MAX = 500
+_MEDIA_TITLE_MAX = 200
+_MEDIA_TYPE_MAX = 32
+_MEDIA_NOTE_MAX = 500
+
+_METADATA_TEXT_LIMITS = {
+    "status": 32,
+    "type": 32,
+    "resolution_reason": 500,
+    "resolved_by": 128,
+    "related_bucket": 128,
+    "author": 120,
+    "user_name": 120,
+    "title": 120,
+    "letter_date": 64,
+    "why_remembered": _WHY_REMEMBERED_MAX,
+    "triggered_by": _TRIGGERED_BY_MAX,
+    "source_tool": _SOURCE_TOOL_MAX,
+    "grow_batch_id": _GROW_BATCH_ID_MAX,
+    "last_merged_by": _SOURCE_TOOL_MAX,
+    "_pre_anchor_source_tool": _SOURCE_TOOL_MAX,
+}
 
 # --- _time_ripple：时间涾漪 ---
 _RIPPLE_HOURS = 48.0       # ±该小时内的桶被轻微唤醒
 _RIPPLE_MAX_BUCKETS = 5    # 一次 touch 最多唤醒几个邻居（有界 I/O）
 _RIPPLE_BOOST = 0.3        # 唤醒时 activation_count 增量
+_MAX_METADATA_DEPTH = 16
+_MAX_METADATA_NODES = 10_000
 
 # --- search 评分 ---
 _VECTOR_TOPK = 50          # embedding 预取 top_k（仅作 semantic 分源，不窄化候选集）
+_VECTOR_RECALL_THRESHOLD = 0.65  # 纯语义候选进入结果池的最低余弦相似度
 _RESOLVED_RANK_PENALTY = 0.3   # resolved 桶仅在排序时降权
 _LITERAL_MATCH_BONUS = 25.0    # 查询串原样命中 name/tags/domain/正文时的召回加分（修短查询召回）
 
-# --- _calc_topic_score 文本维度权重 ---
-_TOPIC_NAME_W = 3.0
-_TOPIC_DOMAIN_W = 2.5
-_TOPIC_TAG_W = 2.0
-_TOPIC_BODY_SLICE = 1000   # body 文本参与 fuzzy 的首部截断长度
-
-# --- _calc_emotion_score ---
-_EMOTION_MAX_DIST = math.sqrt(2)  # Russell 理论最大欧氏距离
-
-# --- _calc_time_score ---
-_TIME_DECAY_LAMBDA = 0.02  # e^(-λ*days)，越小 → 起冷起慢
-_TIME_FALLBACK_DAYS = 30   # 无可解析 last_active 时的默认天数
-
-# --- _calc_touch_score ---
-_TOUCH_NORMALIZE_CAP = 10.0   # activation_count / 该值，裁到 1.0
+# topic/emotion/time/touch 四个评分维度的纯函数 + 权重常量已拆到
+# ombrebrain.retrieval.bucket_scoring（search() 和 _calc_*_score wrapper 都从那里导入）。
 
 
 def _clamp01(value, default: float) -> float:
@@ -145,9 +457,12 @@ def _clamp01(value, default: float) -> float:
     这个 helper 静默钳制，适用于“调用方保证范围、充其量充个防”的场景。
     """
     try:
-        return max(0.0, min(1.0, float(value)))
+        numeric = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(numeric):
+        return default
+    return max(0.0, min(1.0, numeric))
 
 
 class BucketManager:
@@ -160,12 +475,18 @@ class BucketManager:
     天然兼容 Obsidian 直接浏览和编辑。
     """
 
-    def __init__(self, config: dict, embedding_engine=None):
+    def __init__(self, config: dict, embedding_engine=None, v3_runtime=None):
         # iter 1.9 G: 保留原始 config 引用，让 create() 能读 bucket_type_defaults
         # Keep raw config so create() can look up bucket_type_defaults at write time.
         self.config = config
+        self.v3_runtime = v3_runtime
         # --- Read storage paths from config / 从配置中读取存储路径 ---
         self.base_dir = config["buckets_dir"]
+        self.media_store = MediaStore(
+            self.base_dir,
+            str(config.get("media_dir") or os.path.join(self.base_dir, "_media")),
+            max_bytes=int(config.get("media_max_bytes") or 25 * 1024 * 1024),
+        )
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
@@ -174,26 +495,6 @@ class BucketManager:
         self.letter_dir = os.path.join(self.base_dir, "letters")
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
-
-        # --- Wikilink config / 双链配置 ---
-        wikilink_cfg = config.get("wikilink", {})
-        self.wikilink_enabled = wikilink_cfg.get("enabled", True)
-        self.wikilink_use_tags = wikilink_cfg.get("use_tags", False)
-        self.wikilink_use_domain = wikilink_cfg.get("use_domain", True)
-        self.wikilink_use_auto_keywords = wikilink_cfg.get("use_auto_keywords", True)
-        self.wikilink_auto_top_k = wikilink_cfg.get("auto_top_k", 8)
-        self.wikilink_min_len = wikilink_cfg.get("min_keyword_len", 2)
-        self.wikilink_exclude_keywords = set(wikilink_cfg.get("exclude_keywords", []))
-        self.wikilink_stopwords = {
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
-            "都", "一个", "上", "也", "很", "到", "说", "要", "去",
-            "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "她",
-            "我们", "你们", "他们", "然后", "今天", "昨天", "明天", "一下",
-            "the", "and", "for", "are", "but", "not", "you", "all", "can",
-            "had", "her", "was", "one", "our", "out", "has", "have", "with",
-            "this", "that", "from", "they", "been", "said", "will", "each",
-        }
-        self.wikilink_stopwords |= {w.lower() for w in self.wikilink_exclude_keywords}
 
         # --- Search scoring weights / 检索权重配置 ---
         scoring = config.get("scoring_weights", {})
@@ -212,10 +513,233 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+        self.embedding_outbox = None
+        ledger_path = config.get("ledger_path") or os.path.join(
+            self.base_dir, "_ledger", "events.jsonl"
+        )
+        self.ledger_mirror = LedgerMirror(ledger_path)
 
         # BM25 稀疏索引（写操作后脏标记，search() 时懒重建）
         self._bm25: "_BM25Index | None" = _BM25Index() if _BM25Index is not None else None
         self._bm25_dirty: bool = True
+        self._bm25_rebuilding: bool = False  # Avoid concurrent duplicate rebuilds.
+
+        # Active-bucket cache and its on-disk fingerprint are invalidated after writes.
+        self._active_cache: "list[dict] | None" = None
+        self._active_file_state: dict[str, tuple[int, int]] = {}
+        self._active_cache_state_guard = threading.RLock()
+        self._active_cache_generation = 0
+        self._active_cache_lock = _CrossLoopAsyncLock()
+        # Synchronous CRUD paths ask for IDs repeatedly.  A complete index
+        # turns migration conflict/apply checks from O(imported × vault) into
+        # one O(vault) build plus O(1) lookups.  Managed writes invalidate it;
+        # external changes do so when the normal vault poll observes them.
+        self._bucket_path_index_guard = threading.RLock()
+        self._bucket_path_index: dict[str, str] = {}
+        self._bucket_path_index_ready = False
+        # 见 _bucket_turn：archive()/update()/delete()/touch() 各自独立做
+        # find_file → load → mutate → atomic_write，互不知会。并发命中同一个
+        # bucket_id 时（比如衰减引擎后台 archive() 撞上一次 trace/hold 的
+        # update()），后到的那个基于自己读到的旧 file_path 写回，可能在另一个
+        # 已经把文件 move 进 archive/ 之后，在原路径「复活」一份带旧内容的
+        # 桶。找茬会话（2026-07-15）发现，按 tools/_common.py 里 _quota_turn
+        # 同一套跨 loop/进程文件锁方案修，见 _bucket_turn()。
+        storage_cfg = config.get("storage", {}) or {}
+        try:
+            self.external_change_poll_seconds = max(
+                0.0, float(storage_cfg.get("external_change_poll_seconds", 1.0))
+            )
+        except (TypeError, ValueError):
+            self.external_change_poll_seconds = 1.0
+        self._last_file_state_check = 0.0
+        self._external_changes_detected = 0
+        self._last_external_change = ""
+
+    def attach_v3_runtime(self, runtime) -> None:
+        self.v3_runtime = runtime
+
+    def attach_embedding_outbox(self, outbox) -> None:
+        """Attach the durable derived-index queue after both objects exist."""
+        self.embedding_outbox = outbox
+
+    def _queue_derived_state(
+        self,
+        bucket_id: str,
+        *,
+        content: str = "",
+        meaning=None,
+        queue_content: bool = False,
+        queue_meaning: bool = False,
+    ) -> None:
+        """Markdown 提交后同步持久登记派生期望状态，不调用外部 provider。"""
+        outbox = self.embedding_outbox
+        if outbox is None:
+            return
+        try:
+            if queue_content:
+                outbox.enqueue(bucket_id, str(content or ""))
+            if queue_meaning:
+                meaning_list = self._normalize_meaning_list(meaning or [])
+                meaning_text = meaning_list[-1] if meaning_list else ""
+                enqueue_meaning = getattr(outbox, "enqueue_meaning", None)
+                if callable(enqueue_meaning):
+                    enqueue_meaning(bucket_id, meaning_text)
+        except Exception as exc:
+            logger.warning(
+                "Derived outbox enqueue failed / 派生 outbox 入队失败: %s: %s",
+                bucket_id,
+                exc,
+            )
+
+    def _queue_captured_derived_state(self, state: dict | None) -> None:
+        """Persist a commit snapshot after its bucket lease has been released."""
+        if not state:
+            return
+        self._queue_derived_state(
+            str(state.get("bucket_id") or ""),
+            content=str(state.get("content") or ""),
+            meaning=state.get("meaning") or [],
+            queue_content=bool(state.get("queue_content")),
+            queue_meaning=bool(state.get("queue_meaning")),
+        )
+
+    async def _discard_derived_index_if_terminal(self, bucket_id: str) -> None:
+        """Drop queued/vector state outside the bucket lease, with restore CAS."""
+        async with self._derived_index_turn(bucket_id):
+            bucket = await self.get(bucket_id)
+            metadata = (bucket or {}).get("metadata") or {}
+            if bucket and not metadata.get("deleted_at") and not parse_bool(
+                metadata.get("tombstone"), default=False
+            ):
+                # A concurrent explicit restore won after the delete commit.
+                return
+            if self.embedding_outbox is not None:
+                try:
+                    self.embedding_outbox.discard(bucket_id)
+                except Exception as exc:
+                    logger.warning(
+                        "discard embedding outbox failed for %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+            if self.embedding_engine is not None:
+                try:
+                    self.embedding_engine.delete_embedding(bucket_id)
+                except Exception as exc:
+                    logger.warning(
+                        "delete embedding failed for %s: %s", bucket_id, exc
+                    )
+
+    def _record_v3_bucket_event(
+        self,
+        action: str,
+        bucket_id: str,
+        bucket_type: str,
+        content: str,
+        metadata: dict | None,
+    ) -> None:
+        runtime = getattr(self, "v3_runtime", None)
+        recorder = getattr(runtime, "record_bucket_event", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                action=action,
+                bucket_id=bucket_id,
+                bucket_type=bucket_type,
+                content=content,
+                metadata=metadata or {},
+            )
+        except Exception as exc:
+            logger.warning(f"v3 bucket event record failed for {action}:{bucket_id}: {exc}")
+
+    def _record_ledger_event(
+        self,
+        event_type: str,
+        bucket_id: str,
+        bucket_type: str,
+        content: str,
+        metadata: dict | None,
+        extra_payload: dict | None = None,
+    ) -> None:
+        payload = dict(metadata or {})
+        if extra_payload:
+            payload.update(extra_payload)
+        try:
+            self.ledger_mirror.append_event(
+                event_type=event_type,
+                trace_id=bucket_id,
+                trace_kind=bucket_type,
+                payload=payload,
+                body=content,
+            )
+        except Exception as exc:
+            logger.warning(f"ledger mirror record failed for {event_type}:{bucket_id}: {exc}")
+
+    def ledger_integrity_report(self, *, rebuild_projections: bool = False) -> dict:
+        """默认返回只读报告；仅在显式要求时重建持久化投影。"""
+        report = self.ledger_mirror.verify_integrity()
+        events = list(self.ledger_mirror.iter_events())
+        projection = TraceCatalogProjection()
+        projection.rebuild(events)
+        report["trace_catalog_projection"] = projection.to_report(
+            source_latest_seq=int(report.get("latest_seq", 0) or 0)
+        )
+        sqlite_projection_path = os.path.join(
+            self.base_dir, "_ledger", "projections", "trace_catalog.sqlite3"
+        )
+        try:
+            sqlite_projection = TraceSQLiteProjection(sqlite_projection_path)
+            if rebuild_projections:
+                sqlite_projection.rebuild(events)
+            report["sqlite_projection"] = sqlite_projection.to_report(
+                source_latest_seq=int(report.get("latest_seq", 0) or 0)
+            )
+        except Exception as exc:
+            report["sqlite_projection"] = {
+                "projection_name": "trace_catalog_sqlite",
+                "projection_role": "shadow",
+                "canonical": False,
+                "path": sqlite_projection_path,
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:240],
+            }
+        vector_projection_path = getattr(
+            self.embedding_engine,
+            "db_path",
+            os.path.join(self.base_dir, "embeddings.db"),
+        )
+        try:
+            vector_projection = TraceVectorProjectionManifest(vector_projection_path)
+            report["vector_projection"] = vector_projection.rebuild(events)
+        except Exception as exc:
+            report["vector_projection"] = {
+                "projection_name": "trace_vector_manifest",
+                "projection_role": "shadow",
+                "canonical": False,
+                "path": str(vector_projection_path),
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:240],
+            }
+        try:
+            report["formal_invariants"] = FormalInvariantChecker.default().evaluate_ledger(events).to_dict()
+        except Exception as exc:
+            report["formal_invariants"] = {
+                "projection_name": "formal_invariants",
+                "projection_role": "shadow",
+                "canonical": False,
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc)[:240],
+            }
+        report["replay"] = LedgerReplayValidator.default().validate(events)
+        return report
+
+    def footprint_snapshot(self) -> FootprintSnapshot:
+        """读取旧 Ledger 兼容存储，生成面向 breath 的一次性足迹快照。"""
+        return FootprintSnapshot.from_events(self.ledger_mirror.iter_events())
 
     # ---------------------------------------------------------
     # Internal helpers【代码多复用、不作为公共 API】
@@ -243,32 +767,604 @@ class BucketManager:
                     yield root, fname, os.path.join(root, fname)
 
     @staticmethod
-    def _primary_domain(domain: list[str] | None) -> str:
+    def _primary_domain(domain: list[str] | str | None) -> str:
         """取 domain[0] 作为主域子目录名，空/缺失 → 默认 ``未分类``。
 
         在 create / _move_bucket / archive 三处使用。sanitize_name 后才能当路径用。
         """
-        return sanitize_name(domain[0]) if domain else _DEFAULT_DOMAIN_NAME
+        if isinstance(domain, str):
+            primary = domain.strip()
+        elif domain:
+            primary = str(domain[0]).strip()
+        else:
+            primary = ""
+        return sanitize_name(primary) if primary else _DEFAULT_DOMAIN_NAME
+
+    def _max_bucket_bytes(self) -> int:
+        raw = (self.config.get("limits") or {}).get(
+            "max_bucket_bytes", _DEFAULT_MAX_BUCKET_BYTES
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return _DEFAULT_MAX_BUCKET_BYTES
+        return value if value >= 0 else _DEFAULT_MAX_BUCKET_BYTES
+
+    def _validate_bucket_content(self, content: str) -> None:
+        cap = self._max_bucket_bytes()
+        if cap <= 0:
+            return
+        size = len(content.encode("utf-8"))
+        if size > cap:
+            raise ValueError(
+                f"内容过大（{size / 1024:.1f} KB > 上限 {cap / 1024:.0f} KB）。"
+                "请拆分后存入，或调整 config.limits.max_bucket_bytes。"
+            )
+
+    @classmethod
+    def _normalize_metadata_list(
+        cls,
+        values,
+        *,
+        max_items: int,
+        max_chars: int,
+    ) -> list[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values = [values]
+        elif not isinstance(values, (list, tuple, set)):
+            values = [values]
+        normalized: list[str] = []
+        for value in values:
+            text = cls._sanitize_text(str(value)).strip()[:max_chars]
+            if text and text not in normalized:
+                normalized.append(text)
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_meaning_item(cls, text) -> str:
+        """裁剪单条 meaning 文本；不是摘要，只做长度上限保护。"""
+        if not text:
+            return ""
+        return cls._sanitize_text(str(text)).strip()[:_MEANING_ITEM_MAX]
+
+    @classmethod
+    def _normalize_meaning_list(cls, values) -> list[str]:
+        """整体替换用：逐条裁剪 + 丢空条目 + 裁总数上限。
+
+        不去重：同一句话在不同时刻写下也是信息，去重会抹掉这个时间差。
+        """
+        if not values:
+            return []
+        if isinstance(values, str):
+            values = [values]
+        normalized: list[str] = []
+        for v in values:
+            item = cls._normalize_meaning_item(v)
+            if item:
+                normalized.append(item)
+            if len(normalized) >= _MEANING_LIST_MAX_ITEMS:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_media(cls, media) -> list[dict]:
+        """校验持久媒体元数据；path 必须已经由 MediaStore 稳定化。"""
+        if not media:
+            return []
+        if not isinstance(media, list):
+            media = [media]
+        normalized: list[dict] = []
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            path = cls._sanitize_text(str(item.get("path") or "")).strip()[:_MEDIA_PATH_MAX]
+            if not path:
+                continue
+            entry: dict = {"path": path}
+            title = item.get("title")
+            if title:
+                entry["title"] = cls._sanitize_text(str(title)).strip()[:_MEDIA_TITLE_MAX]
+            media_type = item.get("type")
+            if media_type:
+                entry["type"] = cls._sanitize_text(str(media_type)).strip()[:_MEDIA_TYPE_MAX]
+            note = item.get("note")
+            if note:
+                entry["note"] = cls._sanitize_text(str(note)).strip()[:_MEDIA_NOTE_MAX]
+            digest = str(item.get("sha256") or "").lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                entry["sha256"] = digest
+            try:
+                size = int(item.get("size"))
+            except (TypeError, ValueError, OverflowError):
+                size = -1
+            if size >= 0:
+                entry["size"] = size
+            if item.get("stored") is True:
+                entry["stored"] = True
+            normalized.append(entry)
+            if len(normalized) >= _MEDIA_MAX_ITEMS:
+                break
+        return normalized
 
     # ---------------------------------------------------------
     # Internal: keep embedding index in sync with markdown storage
     # 内部：保证向量索引与 markdown 存储层一致
     # ---------------------------------------------------------
-    async def _sync_embedding(self, bucket_id: str, content: str) -> None:
-        """create()/update(content=...) 调用，best-effort 写入向量。
-        embedding_engine 未配置或 disabled 时跳过；失败仅 warning，按 rule.md §1.5 允许降级。"""
+    async def _sync_embedding(self, bucket_id: str, content: str) -> bool:
+        """Best-effort inline indexing for runtimes without a queue worker."""
         if not self.embedding_engine or not getattr(self.embedding_engine, "enabled", False):
-            return
+            return False
         if not content or not content.strip():
+            return True
+        return bool(
+            await self.embedding_engine.generate_and_store(bucket_id, content)
+        )
+
+    async def _sync_meaning_embedding(self, bucket_id: str, meaning_list: list[str]) -> None:
+        """Best-effort: embed the most recent meaning entry, separate from content.
+
+        取列表最后一条：最新的感受通常最贴近当前语境。没有专门的 outbox/重试
+        队列——meaning 向量失败不影响记忆本身已经落盘，稍后可通过再次
+        hold/trace 追加新 meaning 时重新尝试。
+        """
+        meaning_text = meaning_list[-1] if meaning_list else ""
+        outbox = self.embedding_outbox
+        if outbox is not None:
+            try:
+                queued = bool(outbox.enqueue_meaning(bucket_id, meaning_text))
+            except Exception as exc:
+                queued = False
+                logger.warning("meaning outbox enqueue failed for %s: %s", bucket_id, exc)
+            if queued and getattr(outbox, "running", False):
+                return
+        engine = self.embedding_engine
+        if not engine or not getattr(engine, "enabled", False):
+            return
+        if not meaning_text:
+            clear_meaning = getattr(engine, "delete_meaning_embedding", None)
+            if callable(clear_meaning):
+                try:
+                    clear_meaning(bucket_id)
+                    if outbox is not None:
+                        complete_meaning = getattr(
+                            outbox, "complete_meaning", None
+                        )
+                        if callable(complete_meaning):
+                            complete_meaning(bucket_id, meaning_text)
+                except Exception as exc:
+                    logger.warning(f"meaning embedding clear failed for {bucket_id}: {exc}")
+            return
+        store_meaning = getattr(engine, "generate_and_store_meaning", None)
+        if not callable(store_meaning):
             return
         try:
-            await self.embedding_engine.generate_and_store(bucket_id, content)
-        except Exception as e:
-            logger.warning(f"sync embedding failed for {bucket_id}: {e}")
+            stored = bool(await store_meaning(bucket_id, meaning_text))
+            if stored and outbox is not None:
+                complete_meaning = getattr(outbox, "complete_meaning", None)
+                if callable(complete_meaning):
+                    complete_meaning(bucket_id, meaning_text)
+            elif not stored:
+                logger.warning("meaning embedding remained queued for %s", bucket_id)
+        except Exception as exc:
+            logger.warning(f"meaning embedding failed for {bucket_id}: {exc}")
+
+    async def _index_after_write(self, bucket_id: str, content: str) -> None:
+        """Queue derived indexing after Markdown is safely on disk.
+
+        The server runtime starts a durable outbox worker, so this returns
+        without waiting for network I/O.  Standalone/stdio users still get one
+        inline attempt; failures remain queued for a later managed startup.
+        """
+        outbox = self.embedding_outbox
+
+        # A preceding writer may already have converged this exact Markdown
+        # version while the current request waited for the derived lease.
+        # Avoid a second paid/provider call; acknowledge only the matching
+        # content component, leaving a sibling meaning task untouched.
+        engine = self.embedding_engine
+        hash_reader = getattr(engine, "get_content_hash", None)
+        if callable(hash_reader) and content:
+            try:
+                stored_hash = str(hash_reader(bucket_id) or "")
+            except Exception:
+                stored_hash = ""
+            desired_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if stored_hash and stored_hash == desired_hash:
+                if outbox is not None:
+                    complete_content = getattr(
+                        outbox, "complete_content", None
+                    )
+                    if callable(complete_content):
+                        complete_content(bucket_id, content)
+                return
+
+        queued = False
+        if outbox is not None:
+            try:
+                queued = bool(outbox.enqueue(bucket_id, content))
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist embedding outbox item for %s: %s",
+                    bucket_id,
+                    exc,
+                )
+            if queued and getattr(outbox, "running", False):
+                return
+
+        try:
+            indexed = await self._sync_embedding(bucket_id, content)
+        except Exception as exc:
+            indexed = False
+            logger.warning(
+                "Inline embedding attempt failed; memory remains queued / "
+                "同步向量尝试失败，记忆已保留待后台重试: %s: %s",
+                bucket_id,
+                exc,
+            )
+        if indexed and outbox is not None:
+            try:
+                complete_content = getattr(outbox, "complete_content", None)
+                if callable(complete_content):
+                    complete_content(bucket_id, content)
+                else:
+                    outbox.discard(bucket_id)
+            except Exception:
+                logger.warning("Failed to acknowledge embedding outbox item: %s", bucket_id)
+        elif not indexed:
+            logger.warning(
+                "Memory saved without vector; pending retry / 记忆已落盘，向量待重试: %s",
+                bucket_id,
+            )
+
+    async def _index_after_update(
+        self,
+        bucket_id: str,
+        *,
+        content_changed: bool = False,
+        meaning_changed: bool = False,
+    ) -> None:
+        """释放桶写租约后刷新派生索引。
+
+        Markdown 是真源。原子提交后重新读取，并串行化同桶的派生写入，避免旧请求
+        晚返回后覆盖新向量；外部 provider 的延迟不得延长保护文件修改的桶租约。
+        """
+        if not content_changed and not meaning_changed:
+            return
+
+        # 托管服务已在提交后持久入队，由 worker 统一取得派生租约并调用
+        # provider。写请求不能再取得同一租约，否则仍可能排在慢 worker 后等待。
+        outbox = self.embedding_outbox
+        if outbox is not None and getattr(outbox, "running", False):
+            return
+
+        await self._index_after_update_inner(
+            bucket_id,
+            content_changed=content_changed,
+            meaning_changed=meaning_changed,
+        )
+
+    async def _index_after_update_inner(
+        self,
+        bucket_id: str,
+        *,
+        content_changed: bool,
+        meaning_changed: bool,
+    ) -> None:
+        """在独立派生租约内把向量收敛到最新 Markdown 状态。"""
+        try:
+            # 这里故意使用与 ``_bucket_turn`` 不同的租约：慢 provider 运行时
+            # Markdown 写入仍可继续，但同桶派生写入在跨进程场景下保持有序。
+            async with self._derived_index_turn(bucket_id):
+                for _reconcile_pass in range(3):
+                    bucket = await self.get(bucket_id)
+                    if not bucket:
+                        return
+                    metadata = bucket.get("metadata") or {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    if (
+                        str(metadata.get("type") or "").strip().lower()
+                        == "archived"
+                        or metadata.get("deleted_at")
+                        or parse_bool(metadata.get("tombstone"), default=False)
+                    ):
+                        return
+
+                    indexed_content = str(bucket.get("content") or "")
+                    indexed_meaning = self._normalize_meaning_list(
+                        metadata.get("meaning") or []
+                    )
+                    if content_changed:
+                        await self._index_after_write(bucket_id, indexed_content)
+                    if meaning_changed:
+                        await self._sync_meaning_embedding(
+                            bucket_id,
+                            indexed_meaning,
+                        )
+
+                    # 写入在独立派生租约期间仍可继续。provider 返回后再次读取；
+                    # 若正文/meaning 已变化，就在释放派生租约前按最新值再生成一次。
+                    latest = await self.get(bucket_id)
+                    latest_metadata = (latest or {}).get("metadata") or {}
+                    if not isinstance(latest_metadata, dict):
+                        latest_metadata = {}
+                    became_deleted = not latest or (
+                        latest_metadata.get("deleted_at")
+                        or parse_bool(
+                            latest_metadata.get("tombstone"), default=False
+                        )
+                    )
+                    if became_deleted:
+                        if self.embedding_outbox is not None:
+                            try:
+                                self.embedding_outbox.discard(bucket_id)
+                            except Exception:
+                                pass
+                        if self.embedding_engine is not None:
+                            try:
+                                self.embedding_engine.delete_embedding(bucket_id)
+                            except Exception as cleanup_exc:
+                                logger.warning(
+                                    "Late derived-index cleanup failed / "
+                                    "迟到派生索引清理失败: %s: %s",
+                                    bucket_id,
+                                    cleanup_exc,
+                                )
+                        return
+
+                    latest_content = str((latest or {}).get("content") or "")
+                    latest_meaning = self._normalize_meaning_list(
+                        latest_metadata.get("meaning") or []
+                    )
+                    content_stable = (
+                        not content_changed or latest_content == indexed_content
+                    )
+                    meaning_stable = (
+                        not meaning_changed or latest_meaning == indexed_meaning
+                    )
+                    if content_stable and meaning_stable:
+                        return
+                logger.warning(
+                    "Derived index changed repeatedly / 派生索引连续变化，"
+                    "已保留 outbox 最新期望状态: %s",
+                    bucket_id,
+                )
+        except Exception as exc:
+            # Markdown 已提交。派生索引失败独立记录并重试/对账，不回滚或误报正文写入。
+            logger.warning(
+                "Post-update indexing failed for %s: %s: %s",
+                bucket_id,
+                type(exc).__name__,
+                exc,
+            )
 
     def _invalidate_bm25(self) -> None:
-        """写操作后调用，标记 BM25 索引需要重建。search() 时懒触发。"""
-        self._bm25_dirty = True
+        """写操作后调用：标记 BM25 需重建 + 清活跃桶缓存（集合已变，缓存作废）。
+
+        名字沿用历史（各写路径已在调它），实际是「集合变更」的统一失效钩子。
+        """
+        with self._active_cache_state_guard:
+            self._active_cache_generation += 1
+            self._bm25_dirty = True
+            self._active_cache = None
+            self._active_file_state = {}
+            self._last_file_state_check = 0.0
+        with self._bucket_path_index_guard:
+            self._bucket_path_index_ready = False
+            self._bucket_path_index = {}
+
+    def _cache_bump(
+        self,
+        bucket_id: str,
+        *,
+        last_active=None,
+        activation_count=None,
+        file_path: str = "",
+    ) -> None:
+        """touch/ripple 只改了某桶的激活字段（集合没变）→ 就地更新缓存，不清整表。"""
+        with self._active_cache_state_guard:
+            # Even with no published cache, a concurrent builder may have
+            # parsed the pre-touch file.  Bumping the generation makes its
+            # eventual publish fail the CAS and forces a rescan.
+            self._active_cache_generation += 1
+            if self._active_cache is None:
+                return
+            for b in self._active_cache:
+                if b.get("id") == bucket_id:
+                    m = b.get("metadata")
+                    if isinstance(m, dict):
+                        if last_active is not None:
+                            m["last_active"] = last_active
+                        if activation_count is not None:
+                            m["activation_count"] = activation_count
+                    break
+            if file_path:
+                self._refresh_cached_file_state(file_path)
+
+    def _refresh_cached_file_state(self, file_path: str) -> None:
+        """Acknowledge an internal in-place write without invalidating the cache."""
+        with self._active_cache_state_guard:
+            if self._active_cache is None:
+                return
+            normalized = os.path.normcase(os.path.abspath(file_path))
+            try:
+                stat = os.stat(file_path)
+                self._active_file_state[normalized] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                self._active_file_state.pop(normalized, None)
+            self._last_file_state_check = time.monotonic()
+
+    def _scan_active_file_state(self) -> dict[str, tuple[int, int]]:
+        """Return a cheap metadata fingerprint for every active Markdown file."""
+        state: dict[str, tuple[int, int]] = {}
+        for _root, _fname, file_path in self._iter_md_files(self._active_dirs):
+            try:
+                stat = os.stat(file_path)
+            except OSError:
+                continue
+            state[os.path.normcase(os.path.abspath(file_path))] = (
+                stat.st_mtime_ns,
+                stat.st_size,
+            )
+        return state
+
+    def external_change_status(self) -> dict[str, Any]:
+        with self._active_cache_state_guard:
+            return {
+                "poll_seconds": self.external_change_poll_seconds,
+                "detected": self._external_changes_detected,
+                "last_detected": self._last_external_change,
+                "cached_files": len(self._active_file_state),
+            }
+
+    def _reconcile_external_changes(
+        self,
+        previous: list[dict],
+        current: list[dict],
+    ) -> None:
+        """Propagate externally-created/edited/deleted Markdown to derived state."""
+        old_by_id = {str(bucket.get("id") or ""): bucket for bucket in previous}
+        new_by_id = {str(bucket.get("id") or ""): bucket for bucket in current}
+        old_by_id.pop("", None)
+        new_by_id.pop("", None)
+
+        added_ids = set(new_by_id) - set(old_by_id)
+        removed_ids = set(old_by_id) - set(new_by_id)
+        content_changed_ids = {
+            bucket_id
+            for bucket_id in set(old_by_id) & set(new_by_id)
+            if str(old_by_id[bucket_id].get("content") or "")
+            != str(new_by_id[bucket_id].get("content") or "")
+        }
+        meaning_changed_ids = {
+            bucket_id
+            for bucket_id in set(old_by_id) & set(new_by_id)
+            if self._normalize_meaning_list(
+                (old_by_id[bucket_id].get("metadata") or {}).get("meaning") or []
+            )
+            != self._normalize_meaning_list(
+                (new_by_id[bucket_id].get("metadata") or {}).get("meaning") or []
+            )
+        }
+        updated_ids = {
+            bucket_id
+            for bucket_id in set(old_by_id) & set(new_by_id)
+            if bucket_id in content_changed_ids
+            or (old_by_id[bucket_id].get("metadata") or {})
+            != (new_by_id[bucket_id].get("metadata") or {})
+        }
+
+        outbox = self.embedding_outbox
+        if outbox is not None:
+            for bucket_id in sorted(added_ids | content_changed_ids):
+                try:
+                    outbox.enqueue(
+                        bucket_id,
+                        str(new_by_id[bucket_id].get("content") or ""),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "external edit embedding enqueue failed for %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+            enqueue_meaning = getattr(outbox, "enqueue_meaning", None)
+            if callable(enqueue_meaning):
+                for bucket_id in sorted(added_ids | meaning_changed_ids):
+                    try:
+                        meaning = self._normalize_meaning_list(
+                            (new_by_id[bucket_id].get("metadata") or {}).get(
+                                "meaning"
+                            )
+                            or []
+                        )
+                        enqueue_meaning(
+                            bucket_id,
+                            meaning[-1] if meaning else "",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "external meaning enqueue failed for %s: %s",
+                            bucket_id,
+                            exc,
+                        )
+        for bucket_id in sorted(removed_ids):
+            # Moving a file to archive is not physical deletion; keep its
+            # derived vector. Only remove the index when the ID vanished from
+            # every managed directory.
+            if self._find_bucket_file(bucket_id) is not None:
+                continue
+            if outbox is not None:
+                try:
+                    outbox.discard(bucket_id)
+                except Exception:
+                    pass
+            if self.embedding_engine is not None:
+                try:
+                    self.embedding_engine.delete_embedding(bucket_id)
+                except Exception as exc:
+                    logger.warning(
+                        "external delete embedding cleanup failed for %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+
+        for bucket_id in sorted(added_ids):
+            bucket = new_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_create",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+        for bucket_id in sorted(updated_ids):
+            bucket = new_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_update",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+        for bucket_id in sorted(removed_ids):
+            bucket = old_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_delete",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+
+        logger.info(
+            "External vault change reconciled / 外部记忆文件变更已对账: "
+            "added=%s changed=%s removed=%s",
+            len(added_ids),
+            len(updated_ids),
+            len(removed_ids),
+        )
+
+    def _build_bm25_index(self, buckets: list):
+        """在线程里构建一个**全新**的 BM25 索引并返回（性能 P4：jieba 全库分词很慢）。"""
+        idx = _BM25Index()  # type: ignore[operator]
+        idx.build(buckets)
+        return idx
+
+    async def _rebuild_bm25_async(self, buckets: list) -> None:
+        """后台重建 BM25：to_thread 里建新索引，建好原子换入 self._bm25，不阻塞事件循环。"""
+        try:
+            fresh = await asyncio.to_thread(self._build_bm25_index, buckets)
+            self._bm25 = fresh          # 原子替换（单次赋值）
+            self._bm25_dirty = False
+        except Exception as e:
+            logger.warning(f"[bm25] 后台重建失败，保留旧索引: {e}")
+        finally:
+            self._bm25_rebuilding = False
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -286,6 +1382,7 @@ class BucketManager:
         arousal: float = 0.3,
         bucket_type: str = "dynamic",
         name: Optional[str] = None,
+        title: str = "",
         pinned: bool = False,
         protected: bool = False,
         why_remembered: str = "",
@@ -294,6 +1391,13 @@ class BucketManager:
         source_tool: str = "",
         grow_batch_id: str = "",
         bucket_id_override: str = "",
+        allow_embedding_fallback: bool = False,
+        meaning: str = "",
+        media: Any = None,
+        test_data: bool = False,
+        defer_derived_index: bool = False,
+        imported: bool = False,
+        source_refs: Any = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -304,52 +1408,62 @@ class BucketManager:
         pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
 
         iter 2.0 来源追踪：
-        - source_tool: "hold" | "grow" — 记录由哪个工具创建。feel 走 hold 分支，
-          所以 feel 桶 source_tool="hold"，依靠 bucket_type 区分。
+        - source_tool: "hold" | "grow" | "import" — 记录创建来源。feel 走 hold
+          分支，所以 feel 桶 source_tool="hold"，依靠 bucket_type 区分。
         - grow_batch_id: 同一次 grow 调用拆出的所有桶共享同一个 batch_id，
           dashboard 可按 batch 聚合显示。
         - bucket_id_override: 调用方提供的可读 id（如 feel 的
           ``feel_202605011423_V085``）。如果与已有桶冲突，自动追加秒级后缀。
           为空 → 走默认 ``generate_bucket_id()``（12 位 hex）。
+        - imported=True: 对话导入桶的持久化来源标记；创建时间与最后活跃时间
+          均使用本次导入时刻。
         """
+        # ``allow_embedding_fallback`` is retained for API compatibility.
+        # All memory types now write first; embedding is a derived index.
+
         # F-04: 清洗 content / tags / name 中的危险控制字符和双向覆写符
         content = self._sanitize_text(content)
-        if tags:
-            tags = [self._sanitize_text(t) for t in tags]
+        self._validate_bucket_content(content)
         if name:
             name = self._sanitize_text(name)
+        title = normalize_memory_title(self._sanitize_text(title))
+        if source_refs:
+            from ombrebrain.storage.source_store import normalize_source_refs
 
-        # --- iter 2.0: 允许调用方提供可读 bucket_id（feel 分钟级命名等）---
-        # 冲突时追加 ``_<ss>``（秒），再冲突追加 ``_<2hex>`` 随机后缀，
-        # 兜底用纯 UUID，保证不会无限循环。
-        if bucket_id_override:
-            candidate = sanitize_name(bucket_id_override) or generate_bucket_id()
-            bucket_id = candidate
-            if self._find_bucket_file(bucket_id):
-                ss = datetime.now().strftime("%S")
-                bucket_id = f"{candidate}_{ss}"
-                tries = 0
-                while self._find_bucket_file(bucket_id) and tries < 5:
-                    bucket_id = f"{candidate}_{uuid.uuid4().hex[:2]}"
-                    tries += 1
-                if self._find_bucket_file(bucket_id):
-                    logger.warning(
-                        f"bucket_id_override '{candidate}' 反复冲突，回落到随机 id"
-                    )
-                    bucket_id = generate_bucket_id()
-        else:
-            bucket_id = generate_bucket_id()
+            source_refs = normalize_source_refs(source_refs)
+
+        # Candidate selection is finalized immediately before the no-overwrite
+        # write while holding that exact ID's normal bucket turn.  The value
+        # here is provisional so metadata normalization can include a useful
+        # source label without doing an unsafe check-then-write.
+        preferred_bucket_id = (
+            sanitize_name(bucket_id_override) or generate_bucket_id()
+            if bucket_id_override
+            else generate_bucket_id()
+        )
+        bucket_id = preferred_bucket_id
         # 桶名 = "YYYY-MM-DD HH-MM-SS [LLM生成的标题]"，无标题时仅用时间戳。
         # 使用连字符替代冒号，避免 sanitize_name 后续编辑时把冒号去掉破坏可读性。
         _ts = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-        _clean = sanitize_name(name) if name else ""
+        _clean = sanitize_name(title or name) if (title or name) else ""
         bucket_name = (f"{_ts} {_clean}" if (_clean and _clean != "unnamed") else _ts)[:80]
         # feel buckets are allowed to have empty domain; others default to ["未分类"]
         if bucket_type == "feel":
             domain = domain if domain is not None else []
         else:
             domain = domain or [_DEFAULT_DOMAIN_NAME]
-        tags = tags or []
+        domain = self._normalize_metadata_list(
+            domain,
+            max_items=_MAX_DOMAINS,
+            max_chars=_MAX_DOMAIN_CHARS,
+        )
+        if bucket_type != "feel" and not domain:
+            domain = [_DEFAULT_DOMAIN_NAME]
+        tags = self._normalize_metadata_list(
+            tags,
+            max_items=_MAX_TAGS,
+            max_chars=_MAX_TAG_CHARS,
+        )
         linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
 
         # --- Pinned/protected buckets: lock importance to 10 ---
@@ -359,6 +1473,7 @@ class BucketManager:
 
         # --- Build YAML frontmatter metadata / 构建元数据 ---
         # 越界不静默 clamp：会产生 OB-W001/OB-W002 提示走到 MCP 返回末尾
+        created_at = now_iso()
         metadata = {
             "id": bucket_id,
             "name": bucket_name,
@@ -368,10 +1483,22 @@ class BucketManager:
             "arousal": _clamp_unit(arousal, "arousal", f"create:{bucket_id}"),
             "importance": _clamp_importance(importance, f"create:{bucket_id}"),
             "type": bucket_type,
-            "created": now_iso(),
-            "last_active": now_iso(),
+            "created": created_at,
+            "last_active": created_at,
             "activation_count": 0,
         }
+        if title:
+            metadata["title"] = title
+        if source_refs:
+            metadata["source_refs"] = source_refs
+        if imported:
+            metadata["imported"] = True
+        if test_data:
+            metadata["provenance"] = {
+                "kind": "test",
+                "created_by": str(source_tool or "developer")[:_SOURCE_TOOL_MAX],
+                "erasable": True,
+            }
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -396,6 +1523,13 @@ class BucketManager:
         # triggered_by = 触发这条 feel 的源 bucket_id。1.9 会做 UI 联动。
         if triggered_by:
             metadata["triggered_by"] = str(triggered_by).strip()[:_TRIGGERED_BY_MAX]
+        # --- Miss: meaning / media —— 我自己觉得这条记忆为什么值得被想起 ---
+        # meaning 是 list[str]：新建时只有一条（这次 hold 传入的那句）；后续
+        # 每次 hold/trace 追加都会往这个列表里继续加。media 是不透明的外部引用列表。
+        # 两者都可选，互不依赖，也不参与打分。
+        meaning_item = self._normalize_meaning_item(meaning)
+        if meaning_item:
+            metadata["meaning"] = [meaning_item]
         # --- iter 1.8: plan 的「承诺重量」0.0-1.0，与 importance 不同 ---
         # importance = 这件事多重要；weight = 这件事压在我心头多重。
         if bucket_type == "plan" and weight is not None:
@@ -410,7 +1544,7 @@ class BucketManager:
                 if "weight" in type_defaults and "weight" not in metadata and weight is None:
                     metadata["weight"] = _clamp01(type_defaults["weight"], _DEFAULT_VALENCE)
                 if "dont_surface" in type_defaults and "dont_surface" not in metadata:
-                    if bool(type_defaults["dont_surface"]):
+                    if parse_bool(type_defaults["dont_surface"], default=False):
                         metadata["dont_surface"] = True
                 if "why_remembered" in type_defaults and not why_remembered:
                     metadata["why_remembered"] = str(type_defaults["why_remembered"]).strip()[:_WHY_REMEMBERED_MAX]
@@ -429,10 +1563,6 @@ class BucketManager:
             except Exception as e:
                 # 失败不阻塞写入主流程
                 logger.warning(f"first_of_kind check failed / 首次标记检测失败: {e}")
-
-        # --- Assemble Markdown file (frontmatter + body) ---
-        # --- 组装 Markdown 文件 ---
-        post = frontmatter.Post(linked_content, **metadata)  # type: ignore[arg-type]
 
         # --- Choose directory by type + primary domain ---
         # --- 按类型 + 主题域选择存储目录 ---
@@ -457,33 +1587,123 @@ class BucketManager:
         target_dir = os.path.join(type_dir, primary_domain)
         os.makedirs(target_dir, exist_ok=True)
 
-        # --- Filename: readable_name_bucketID.md (Obsidian friendly) ---
-        # --- 文件名：可读名称_桶ID.md ---
-        if bucket_name and bucket_name != bucket_id:
-            filename = f"{bucket_name}_{bucket_id}.md"
-        else:
-            filename = f"{bucket_id}.md"
-        file_path = safe_path(target_dir, filename)
+        def _candidate_ids():
+            yield preferred_bucket_id
+            if bucket_id_override:
+                yield f"{preferred_bucket_id}_{datetime.now().strftime('%S')}"
+                for _attempt in range(5):
+                    yield f"{preferred_bucket_id}_{uuid.uuid4().hex[:2]}"
+            while True:
+                yield generate_bucket_id()
 
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
-            raise
+        # Finalize the ID, persist any ID-keyed media and publish the Markdown
+        # while holding the same turn used by update/migrate/delete.  The
+        # second existence check closes the former create-vs-migrate TOCTOU.
+        collision_count = 0
+        for candidate_id in _candidate_ids():
+            async with self._bucket_turn(candidate_id):
+                if self._find_bucket_file(candidate_id):
+                    collision_count += 1
+                    continue
+
+                if bucket_name and bucket_name != candidate_id:
+                    filename = f"{bucket_name}_{candidate_id}.md"
+                else:
+                    filename = f"{candidate_id}.md"
+                candidate_path = safe_path(target_dir, filename)
+                if os.path.exists(candidate_path):
+                    collision_count += 1
+                    continue
+
+                bucket_id = candidate_id
+                metadata["id"] = bucket_id
+                metadata.pop("media", None)
+                persisted_media = await self.media_store.persist(bucket_id, media)
+                normalized_media = self._normalize_media(persisted_media)
+                if normalized_media:
+                    metadata["media"] = normalized_media
+
+                post = frontmatter.Post(  # type: ignore[arg-type]
+                    linked_content,
+                    **metadata,
+                )
+                try:
+                    # Publish the file and its ID lookup entry under the same
+                    # path-index guard.  The collision check above can leave a
+                    # complete, ready index that does not yet contain this new
+                    # ID; without this hand-off an outbox worker can observe
+                    # the committed Markdown as "missing" and discard its
+                    # embedding task while create() awaits meaning indexing.
+                    with self._bucket_path_index_guard:
+                        _atomic_create_text(
+                            candidate_path, frontmatter.dumps(post)
+                        )
+                        self._bucket_path_index[bucket_id] = candidate_path
+                except FileExistsError:
+                    # An unmanaged writer may not honor the bucket turn.  The
+                    # no-overwrite publish still protects its file; choose a
+                    # fresh ID instead of replacing it.
+                    collision_count += 1
+                    continue
+                except OSError as e:
+                    logger.error(
+                        "Failed to write bucket file / 写入桶文件失败: "
+                        "%s: %s",
+                        candidate_path,
+                        e,
+                    )
+                    raise
+                break
+
+        # 不在 bucket lease 内等待全局 outbox 文件事务。async context 退出后到
+        # 这里没有任何 await，因而先持久登记派生期望状态，再允许取消点出现。
+        self._queue_derived_state(
+            bucket_id,
+            content=linked_content,
+            meaning=metadata.get("meaning") or [],
+            queue_content=True,
+            queue_meaning=bool(metadata.get("meaning")),
+        )
+
+        if collision_count > 6:
+            logger.warning(
+                "bucket_id_override %r repeatedly conflicted; used random id %s",
+                preferred_bucket_id,
+                bucket_id,
+            )
+
+        # Markdown becomes the visible source of truth before any network or
+        # derived-index await.  This also changes the path index from the
+        # precise hand-off above to a normal lazy rebuild for later lookups.
+        self._invalidate_bm25()
 
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
 
-        # --- iter 2.1+: 索引/存储一致性 —— 桶落盘后立刻同步生成 embedding ---
-        # 之前依赖每个调用方自己记得调 generate_and_store，结果出现「文件存在但向量缺失」
-        # 的孤儿桶：search() 走向量预筛会把这种桶整体过滤掉，breath 检索就「数对不上」。
-        # 这里把同步内聚到 bucket_manager，调用方无需关心；失败仅 warning，桶照样存在
-        # （embedding 失败属于允许降级，rule.md §1.5）。
-        await self._sync_embedding(bucket_id, linked_content)
-        self._invalidate_bm25()
+        # Markdown 先提交，再处理派生索引。托管服务入队后立即返回，独立模式尝试一次。
+        # meaning 保持独立向量，避免被可能很长的 content 正文稀释。
+        if not defer_derived_index:
+            await self._index_after_update(
+                bucket_id,
+                content_changed=True,
+                meaning_changed=bool(metadata.get("meaning")),
+            )
+        self._record_v3_bucket_event(
+            "create",
+            bucket_id,
+            str(metadata.get("type") or bucket_type),
+            linked_content,
+            metadata,
+        )
+        self._record_ledger_event(
+            "TraceCreated",
+            bucket_id,
+            str(metadata.get("type") or bucket_type),
+            linked_content,
+            metadata,
+        )
 
         return bucket_id
 
@@ -509,6 +1729,42 @@ class BucketManager:
             return None
         return data
 
+    async def get_including_archive(self, bucket_id: str) -> Optional[dict]:
+        """Read one bucket by ID without hiding its archived/tombstoned state."""
+        if not bucket_id or not isinstance(bucket_id, str):
+            return None
+        file_path = self._find_bucket_file(bucket_id)
+        return self._load_bucket(file_path) if file_path else None
+
+    def find_exact_content(
+        self,
+        content: str,
+        domain_filter: Optional[list[str]] = None,
+    ) -> Optional[dict]:
+        """Read Markdown directly for an exact match, bypassing derived caches."""
+        expected = self._sanitize_text(content)
+        filter_set = {
+            str(domain).strip().lower()
+            for domain in (domain_filter or [])
+            if str(domain).strip()
+        }
+        for _root, _fname, file_path in self._iter_md_files(self._active_dirs):
+            bucket = self._load_bucket(file_path)
+            if not bucket or bucket.get("content") != expected:
+                continue
+            metadata = bucket.get("metadata", {})
+            if metadata.get("deleted_at"):
+                continue
+            domains = metadata.get("domain") or []
+            if isinstance(domains, str):
+                domains = [domains]
+            if filter_set and not {
+                str(domain).strip().lower() for domain in domains
+            } & filter_set:
+                continue
+            return bucket
+        return None
+
     # ---------------------------------------------------------
     # Move bucket between directories
     # 在目录间移动桶文件
@@ -528,19 +1784,444 @@ class BucketManager:
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
         return str(new_path)
 
+    def _bucket_target_path(
+        self,
+        file_path: str,
+        bucket_type: str,
+        domain: Optional[list[str]] = None,
+        status: str = "",
+    ) -> str:
+        """Return the canonical storage path for an editable bucket type.
+
+        The frontmatter ``type`` is the logical source of truth, but the vault
+        layout is part of the public Obsidian contract too.  Keeping this
+        mapping in one place prevents dashboard edits from changing metadata
+        without moving the Markdown file.
+        """
+        normalized_type = str(bucket_type or "dynamic").strip().lower()
+        if normalized_type not in _EDITABLE_BUCKET_TYPES:
+            raise ValueError(f"unsupported editable bucket type: {normalized_type}")
+
+        if normalized_type == "permanent":
+            type_dir = self.permanent_dir
+            subdir = self._primary_domain(domain)
+        elif normalized_type == "feel":
+            type_dir = self.feel_dir
+            subdir = "沉淀物"
+        elif normalized_type == "plan":
+            type_dir = self.plan_dir
+            normalized_status = str(status or "active").strip().lower()
+            subdir = normalized_status if normalized_status in _PLAN_STATUSES else "active"
+        elif normalized_type == "letter":
+            type_dir = self.letter_dir
+            subdir = "history"
+        else:
+            # ``i`` / ``self`` are private logical channels, not separate
+            # physical stores.  They intentionally live under dynamic/<domain>.
+            type_dir = self.dynamic_dir
+            subdir = self._primary_domain(domain)
+
+        target_dir = os.path.join(type_dir, subdir)
+        os.makedirs(target_dir, exist_ok=True)
+        return str(safe_path(target_dir, os.path.basename(file_path)))
+
+    @staticmethod
+    def _same_path(left: str, right: str) -> bool:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
+
+    def _commit_bucket_update(
+        self,
+        file_path: str,
+        target_path: str,
+        serialized: str,
+    ) -> str:
+        """Commit an update without leaving type/path split-brain on failure.
+
+        In-place edits use the normal atomic writer.  A directory migration is
+        copy-on-commit: atomically write the complete new file at its canonical
+        destination, then remove the untouched source.  If source removal
+        fails, delete the new copy and keep the original as the sole truth.
+        Existing destination files are never overwritten.
+        """
+        if self._same_path(file_path, target_path):
+            _atomic_write_text(file_path, serialized)
+            return file_path
+
+        if os.path.exists(target_path):
+            raise FileExistsError(
+                f"bucket migration target already exists: {target_path}"
+            )
+
+        _atomic_write_text(target_path, serialized)
+        try:
+            os.remove(file_path)
+        except Exception:
+            try:
+                os.remove(target_path)
+            except OSError as rollback_error:
+                logger.critical(
+                    "Failed to roll back bucket migration target %s: %s",
+                    target_path,
+                    rollback_error,
+                )
+            raise
+
+        logger.info(
+            "Moved bucket / 移动记忆桶: %s → %s/",
+            os.path.basename(file_path),
+            os.path.dirname(target_path),
+        )
+        return target_path
+    def _bucket_turn(self, bucket_id: str):
+        """Serialize archive()/update()/delete()/touch() on the same bucket_id.
+        Uses the same cross-loop/cross-process lock-file mechanism as
+        ``tools/_common.py``'s ``_quota_turn`` rather than an ``asyncio.Lock``
+        — FastMCP may dispatch requests from different event loops/threads,
+        so an in-process lock would not actually serialize them.
+        """
+        return _filesystem_turn(str(self.base_dir), f"bucket-{bucket_id}")
+
+    def _derived_index_turn(self, bucket_id: str):
+        """不占用桶修改租约，单独保证同桶派生写入顺序。"""
+        return _filesystem_turn(
+            str(self.base_dir),
+            f"derived-index-{bucket_id}",
+            timeout_seconds=300.0,
+        )
+
+    def human_name_change_turn(self):
+        """Serialize config + vault human-name migrations as one transaction.
+
+        Per-bucket turns protect each Markdown write, but they cannot by
+        themselves stop two full-vault rename jobs from interleaving.  Routes
+        that change or synchronize the human display name hold this outer
+        process/cross-process lease from the config read through the last
+        bucket replacement.
+        """
+
+        return _filesystem_turn(
+            str(self.base_dir),
+            "settings-human-name",
+            timeout_seconds=300.0,
+        )
+
+    async def replace_text_fields(self, old: str, new: str) -> dict[str, int]:
+        """Replace a display term through managed per-bucket transactions.
+
+        This is used when the configured human name changes.  It deliberately
+        does not bump ``last_active``: a display-name migration is not a memory
+        activation.  Each bucket is re-read while holding the normal
+        cross-process bucket lock and then committed through ``_update_locked``
+        so atomic writes, ledger/projection events and concurrent edits retain
+        the same guarantees as every other mutation. 派生索引只在桶租约释放后刷新。
+        """
+
+        if not old or not new or old == new:
+            return {"buckets_changed": 0, "replacements": 0}
+
+        pattern = re.compile(re.escape(old))
+        bucket_ids: list[str] = []
+        seen: set[str] = set()
+        directories = list(self._active_dirs) + [self.archive_dir]
+        for _root, _filename, file_path in self._iter_md_files(directories):
+            bucket = self._load_bucket(file_path)
+            bucket_id = str((bucket or {}).get("id") or "").strip()
+            if bucket_id and bucket_id not in seen:
+                seen.add(bucket_id)
+                bucket_ids.append(bucket_id)
+
+        changed = 0
+        total = 0
+        for bucket_id in bucket_ids:
+            committed = False
+            content_changed = False
+            replacements = 0
+            derived_state: dict[str, Any] = {}
+            async with self._bucket_turn(bucket_id):
+                file_path = self._find_bucket_file(bucket_id)
+                if not file_path:
+                    continue
+                try:
+                    post = frontmatter.load(file_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load bucket for text replacement %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+                    continue
+
+                replacements = 0
+                updates: dict[str, str] = {}
+                # A callable replacement is literal.  Passing ``new`` directly
+                # would interpret user-controlled ``\\1``/``\\g<name>`` syntax
+                # as regular-expression group references.
+                content, count = pattern.subn(lambda _match: new, post.content or "")
+                if count:
+                    updates["content"] = content
+                    replacements += count
+                for field in ("name", "why_remembered", "user_name"):
+                    value = post.get(field)
+                    if not isinstance(value, str) or not value:
+                        continue
+                    replaced, count = pattern.subn(lambda _match: new, value)
+                    if count:
+                        updates[field] = replaced
+                        replacements += count
+
+                if not updates:
+                    continue
+                try:
+                    committed = await self._update_locked(
+                        bucket_id,
+                        _derived_state_out=derived_state,
+                        **updates,
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        "Text replacement rejected for bucket %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+                    continue
+                content_changed = "content" in updates
+            if committed:
+                self._queue_captured_derived_state(derived_state)
+                await self._index_after_update(
+                    bucket_id,
+                    content_changed=content_changed,
+                )
+                changed += 1
+                total += replacements
+
+        return {"buckets_changed": changed, "replacements": total}
+
+    async def update_content_fragment(
+        self,
+        bucket_id: str,
+        *,
+        old_str: str,
+        new_str: str,
+        append_plan_history: bool = False,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Atomically replace one unique literal fragment in a bucket body.
+
+        The match and the write deliberately happen under the same per-bucket
+        cross-process lock.  Computing the replacement from an earlier
+        ``get()`` result would let a concurrent trace/update be overwritten by
+        a stale full-body snapshot.
+
+        ``new_str`` may be empty (delete the matched fragment).  Zero matches
+        and multiple matches are both non-mutating results so callers never
+        have to guess which occurrence was intended.
+        """
+        old_text = str(old_str)
+        replacement = str(new_str)
+        if not old_text:
+            return {"ok": False, "error": "empty_old_str", "matches": 0}
+        if "content" in kwargs:
+            return {"ok": False, "error": "content_conflict", "matches": 0}
+
+        meaning_changed = "meaning" in kwargs or "meaning_append" in kwargs
+        derived_state: dict[str, Any] = {}
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return {"ok": False, "error": "not_found", "matches": 0}
+            try:
+                post = frontmatter.load(file_path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load bucket for content patch %s: %s",
+                    bucket_id,
+                    exc,
+                )
+                return {"ok": False, "error": "read_failed", "matches": 0}
+
+            current_content = str(post.content or "")
+            # ``str.count`` ignores overlapping occurrences ("aa" in "aaa"),
+            # which could silently patch the first of two valid match starts.
+            # Only 0/1/many matters, so stop at the second start rather than
+            # scanning every pathological overlapping match.
+            first_match = current_content.find(old_text)
+            if first_match < 0:
+                return {
+                    "ok": False,
+                    "error": "old_str_not_found",
+                    "matches": 0,
+                }
+            second_match = current_content.find(old_text, first_match + 1)
+            if second_match >= 0:
+                return {
+                    "ok": False,
+                    "error": "old_str_ambiguous",
+                    "matches": 2,
+                }
+
+            updated_content = self._sanitize_text(
+                current_content.replace(old_text, replacement, 1)
+            )
+            if updated_content == current_content:
+                return {"ok": False, "error": "unchanged", "matches": 1}
+            if not updated_content.strip():
+                return {
+                    "ok": False,
+                    "error": "invalid_content",
+                    "matches": 1,
+                    "message": "替换后正文不能为空；如需移除整个桶，请使用归档。",
+                }
+
+            updates = dict(kwargs)
+            if append_plan_history and str(post.get("type") or "") == "plan":
+                history = list(post.get("change_log") or [])
+                if "status" in updates and updates["status"] != post.get("status"):
+                    history = append_plan_change_log(
+                        history,
+                        "status",
+                        **{"from": post.get("status"), "to": updates["status"]},
+                    )
+                updates["change_log"] = append_plan_change_log(history, "edit")
+            updates["content"] = updated_content
+            try:
+                committed = await self._update_locked(
+                    bucket_id,
+                    _derived_state_out=derived_state,
+                    **updates,
+                )
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "error": "invalid_content",
+                    "matches": 1,
+                    "message": str(exc),
+                }
+            result = {
+                "ok": bool(committed),
+                "error": "" if committed else "update_failed",
+                "matches": 1,
+            }
+        if result["ok"]:
+            self._queue_captured_derived_state(derived_state)
+            await self._index_after_update(
+                bucket_id,
+                content_changed=True,
+                meaning_changed=meaning_changed,
+            )
+        return result
+
     # ---------------------------------------------------------
     # Update bucket
     # 更新桶
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
-    async def update(self, bucket_id: str, **kwargs) -> bool:
+    async def update(
+        self,
+        bucket_id: str,
+        *,
+        allow_embedding_fallback: bool = False,
+        bump_active: bool = False,
+        **kwargs,
+    ) -> bool:
         """
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
+
+        bump_active=False（默认）：纯元数据/内容编辑（trace、plan、anchor、后台
+        自动 resolve、导入等）——**不**刷新 last_active，也不动 activation_count。
+        bump_active=True：把这次写入视作一次真实激活（如 hold/grow 合并近邻桶），
+        同步刷新 last_active 并累加 activation_count，语义与 touch() 一致。
         """
+        content_changed = "content" in kwargs
+        meaning_changed = "meaning" in kwargs or "meaning_append" in kwargs
+        derived_state: dict[str, Any] = {}
+        async with self._bucket_turn(bucket_id):
+            committed = await self._update_locked(
+                bucket_id,
+                allow_embedding_fallback=allow_embedding_fallback,
+                bump_active=bump_active,
+                _derived_state_out=derived_state,
+                **kwargs,
+            )
+        if committed:
+            self._queue_captured_derived_state(derived_state)
+            await self._index_after_update(
+                bucket_id,
+                content_changed=content_changed,
+                meaning_changed=meaning_changed,
+            )
+        return committed
+
+    async def _update_locked(
+        self,
+        bucket_id: str,
+        *,
+        _derived_state_out: dict[str, Any],
+        allow_embedding_fallback: bool = False,
+        bump_active: bool = False,
+        **kwargs,
+    ) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
+
+        # Normalize public/migration inputs at the storage boundary.  A quoted
+        # YAML value such as "false" must never be persisted as true merely
+        # because Python considers non-empty strings truthy.
+        for field in (
+            "resolved",
+            "pinned",
+            "digested",
+            "dont_surface",
+            "first_of_kind",
+            "anchor",
+        ):
+            if field in kwargs:
+                kwargs[field] = parse_bool(kwargs[field])
+
+        if "content" in kwargs:
+            kwargs["content"] = self._sanitize_text(kwargs["content"])
+            self._validate_bucket_content(kwargs["content"])
+        if "tags" in kwargs:
+            kwargs["tags"] = self._normalize_metadata_list(
+                kwargs["tags"],
+                max_items=_MAX_TAGS,
+                max_chars=_MAX_TAG_CHARS,
+            )
+        if "domain" in kwargs:
+            kwargs["domain"] = self._normalize_metadata_list(
+                kwargs["domain"],
+                max_items=_MAX_DOMAINS,
+                max_chars=_MAX_DOMAIN_CHARS,
+            ) or [_DEFAULT_DOMAIN_NAME]
+        if "media" in kwargs:
+            # Miss: media 是整体覆盖写入（trace 的 media_replace）。传空列表即清空该字段。
+            kwargs["media"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media"])
+            )
+        if "media_append" in kwargs:
+            # Miss: media_append 是追加写入（trace 的 media_append / hold 每次调用）。
+            kwargs["media_append"] = self._normalize_media(
+                await self.media_store.persist(bucket_id, kwargs["media_append"])
+            )
+        if "meaning" in kwargs:
+            # Miss: meaning 整体覆盖写入（trace 的 meaning_replace，用于纠错/清理）。
+            kwargs["meaning"] = self._normalize_meaning_list(kwargs["meaning"])
+        if "meaning_append" in kwargs:
+            # Miss: meaning_append 是追加一条新 meaning（trace 的 meaning_append / hold 每次调用）。
+            kwargs["meaning_append"] = self._normalize_meaning_item(kwargs["meaning_append"])
+        if "title" in kwargs:
+            kwargs["title"] = normalize_memory_title(
+                self._sanitize_text(kwargs["title"])
+            )
+        if "source_refs_append" in kwargs:
+            from ombrebrain.storage.source_store import normalize_source_refs
+
+            kwargs["source_refs_append"] = normalize_source_refs(
+                kwargs["source_refs_append"]
+            )
 
         try:
             post = frontmatter.load(file_path)
@@ -548,12 +2229,81 @@ class BucketManager:
             logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
             return False
 
-        # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
-        # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
-        was_pinned = bool(post.get("pinned", False))
-        is_pinned = post.get("pinned", False) or post.get("protected", False)
-        if is_pinned:
-            kwargs.pop("importance", None)  # silently ignore importance update
+        # Work out the final pin/type state before mutating the post.  Type is
+        # also a physical-storage decision, so unsupported values must fail
+        # here instead of being written into frontmatter and reported as a
+        # successful edit.
+        was_pinned = parse_bool(post.get("pinned", False), default=False)
+        is_protected = parse_bool(post.get("protected", False), default=False)
+        current_type = str(post.get("type") or "dynamic").strip().lower()
+        if (
+            current_type == "archived"
+            or post.get("deleted_at")
+            or parse_bool(post.get("tombstone"), default=False)
+        ):
+            # Archive is a terminal lifecycle transition.  Allowing an
+            # ordinary update here is unsafe even when ``type`` was omitted:
+            # pinned=True forces type=permanent below and could otherwise
+            # resurrect an archived file into the active tree.
+            logger.warning(
+                "update() rejected mutation on terminal bucket=%s",
+                bucket_id,
+            )
+            return False
+        will_be_pinned = parse_bool(
+            kwargs.get("pinned", was_pinned), default=was_pinned
+        )
+
+        requested_type: str | None = None
+        if "type" in kwargs:
+            requested_type = str(kwargs["type"] or "").strip().lower()
+            if requested_type not in _EDITABLE_BUCKET_TYPES:
+                logger.warning(
+                    "update() rejected unsupported type=%r for bucket=%s",
+                    requested_type,
+                    bucket_id,
+                )
+                return False
+        forced_type: str | None = None
+        if will_be_pinned:
+            forced_type = "permanent"
+        elif "pinned" in kwargs and was_pinned and not is_protected:
+            # A true pinned bucket demotes when explicitly unpinned.  Explicit
+            # permanent memories (was_pinned=False) remain permanent.
+            forced_type = "dynamic"
+
+        if forced_type is not None:
+            if requested_type is not None and requested_type != forced_type:
+                logger.warning(
+                    "update() rejected incompatible pinned/type transition "
+                    "bucket=%s pinned=%s type=%s",
+                    bucket_id,
+                    will_be_pinned,
+                    requested_type,
+                )
+                return False
+            kwargs["type"] = forced_type
+            requested_type = forced_type
+
+        if (
+            requested_type is not None
+            and requested_type != current_type
+            and is_protected
+            and requested_type != "permanent"
+        ):
+            logger.warning(
+                "update() rejected protected bucket type transition "
+                "bucket=%s type=%s",
+                bucket_id,
+                requested_type,
+            )
+            return False
+
+        # pinned/protected buckets lock importance at 10.  An atomic
+        # pinned=False + importance=N transition is allowed, because the final
+        # state is no longer pinned; this is needed for quota-safe unpinning.
+        if will_be_pinned or is_protected:
+            kwargs.pop("importance", None)
 
         # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
@@ -570,24 +2320,59 @@ class BucketManager:
             post["arousal"] = _clamp_unit(kwargs["arousal"], "arousal", f"update:{bucket_id}")
         if "name" in kwargs:
             post["name"] = sanitize_name(kwargs["name"])
+        if "title" in kwargs and kwargs["title"]:
+            post["title"] = kwargs["title"]
+        if "source_refs_append" in kwargs and kwargs["source_refs_append"]:
+            from ombrebrain.storage.source_store import normalize_source_refs
+
+            existing_refs = post.get("source_refs") or []
+            post["source_refs"] = normalize_source_refs(
+                list(existing_refs) + list(kwargs["source_refs_append"])
+            )
         if "resolved" in kwargs:
-            post["resolved"] = bool(kwargs["resolved"])
+            post["resolved"] = kwargs["resolved"]
         if "pinned" in kwargs:
-            post["pinned"] = bool(kwargs["pinned"])
+            post["pinned"] = kwargs["pinned"]
             if kwargs["pinned"]:
                 post["importance"] = _PINNED_IMPORTANCE  # pinned → lock importance to 10
                 post.metadata.pop("anchor", None)  # pinned 与 anchor 互斥：钉为核心准则即清除坐标系标记
         if "digested" in kwargs:
-            post["digested"] = bool(kwargs["digested"])
+            post["digested"] = kwargs["digested"]
         if "model_valence" in kwargs:
             post["model_valence"] = _clamp01(kwargs["model_valence"], _DEFAULT_VALENCE)
+        if "media" in kwargs:
+            # Miss: 整体覆盖写入（trace media_replace）；空列表清空该字段。
+            if kwargs["media"]:
+                post["media"] = kwargs["media"]
+            else:
+                post.metadata.pop("media", None)
+        if "media_append" in kwargs and kwargs["media_append"]:
+            # Miss: 追加写入，去重同 path 的旧引用（trace media_append / hold 每次调用）。
+            existing_media = post.get("media") or []
+            existing_paths = {m.get("path") for m in existing_media if isinstance(m, dict)}
+            appended = existing_media + [
+                m for m in kwargs["media_append"] if m.get("path") not in existing_paths
+            ]
+            post["media"] = appended[:_MEDIA_MAX_ITEMS]
+        if "meaning" in kwargs:
+            # Miss: 整体覆盖写入（trace meaning_replace，用于纠错/清理）；空列表清空该字段。
+            if kwargs["meaning"]:
+                post["meaning"] = kwargs["meaning"]
+            else:
+                post.metadata.pop("meaning", None)
+        if "meaning_append" in kwargs and kwargs["meaning_append"]:
+            # Miss: 追加一条新 meaning，不覆盖已有的（trace meaning_append / hold 每次调用）。
+            existing_meaning = post.get("meaning") or []
+            if isinstance(existing_meaning, str):
+                existing_meaning = [existing_meaning]
+            post["meaning"] = (list(existing_meaning) + [kwargs["meaning_append"]])[:_MEANING_LIST_MAX_ITEMS]
         # --- Pass-through fields for plan/letter lifecycle ---
         # --- plan/letter/iter1.7 生命周期相关字段直接透传到 frontmatter ---
         # 这一组字段没有「校验/转换」逻辑，给什么写什么。新增字段往这个元组里加即可。
         # iter 1.7 §G3 在这里加入了 "change_log"——plan 桶的状态/编辑历史 list[dict]，
         # 由 server.py 的 plan() / trace() / /api/plans/{id}/action 维护，bucket_manager 不参与生成。
         for k in ("status", "type", "resolution_reason", "resolved_by",
-                  "related_bucket", "author", "user_name", "title", "letter_date",
+                  "related_bucket", "author", "user_name", "letter_date",
                   "change_log",
                   # iter 1.8 新增字段。除 weight 外全部透传不转换。
                   # weight 在 plan 上才有意义；这里不在这个循环里校验类型，由上层 server.py 保证传入范围。
@@ -609,16 +2394,18 @@ class BucketManager:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
                 elif k == "dont_surface":
-                    post[k] = bool(kwargs[k])
+                    post[k] = kwargs[k]
                 elif k == "first_of_kind":
-                    post[k] = bool(kwargs[k])
+                    post[k] = kwargs[k]
                 elif k == "anchor":
                     # iter 2.0: anchor 是布尔；False 时直接删除字段保持 frontmatter 干净。
                     # 修复：透传路径之前会绕过 ANCHOR_LIMIT，导致批量脚本/前端直接 update(anchor=True)
                     # 可以让 anchor 总数突破 24 上限。这里补一道校验：
                     # 仅当从 False→True 切换时才计数；当前已是 anchor 的桶重复设置不计数。
-                    if bool(kwargs[k]):
-                        already_anchor = bool(post.get("anchor", False))
+                    if kwargs[k]:
+                        already_anchor = parse_bool(
+                            post.get("anchor", False), default=False
+                        )
                         if not already_anchor:
                             # FIX (RED-02): count_anchors 是 async，必须 await，否则
                             # `coroutine >= int` 会 TypeError，整个上限校验失效。
@@ -636,56 +2423,139 @@ class BucketManager:
                     if kwargs[k] is None:
                         # None = 明确删除该 frontmatter 字段（用于 anchor release 清理临时字段）
                         post.metadata.pop(k, None)
+                    elif k in _METADATA_TEXT_LIMITS:
+                        post[k] = self._sanitize_text(str(kwargs[k])).strip()[
+                            :_METADATA_TEXT_LIMITS[k]
+                        ]
                     else:
                         post[k] = kwargs[k]
 
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
-        post["last_active"] = now_iso()
+        # --- 激活时间 / 激活次数 ---
+        # last_active 只代表「最后一次真实激活/召回」，并作为衰减 recency 打分的输入。
+        # 元数据编辑（trace / plan / anchor / 后台自动 resolve 等）**不算「活跃」**：
+        # 若在此无条件刷新，会重置遗忘时效，还会让 activation_count 与 last_active
+        # 长期不一致（次数不涨、时间却变新）。只有真正的「新事件写入」才把这条记忆
+        # 当作被重新激活一次——由 bump_active=True 显式触发（如 hold/grow 合并近邻桶），
+        # 同步刷新 last_active 并累加 activation_count，语义与 touch() 一致。
+        if bump_active:
+            post["last_active"] = now_iso()
+            post["activation_count"] = int(post.get("activation_count") or 0) + 1
+
+        final_type = str(post.get("type") or current_type).strip().lower()
+        target_path = file_path
+        if final_type in _EDITABLE_BUCKET_TYPES:
+            target_path = self._bucket_target_path(
+                file_path,
+                final_type,
+                post.get("domain") or [_DEFAULT_DOMAIN_NAME],
+                str(post.get("status") or "active"),
+            )
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
+            committed_path = self._commit_bucket_update(
+                file_path,
+                target_path,
+                frontmatter.dumps(post),
+            )
+        except (OSError, ValueError) as e:
+            logger.error(
+                "Failed to commit bucket update / 提交桶更新失败: "
+                "%s -> %s: %s",
+                file_path,
+                target_path,
+                e,
+            )
             return False
 
-        # --- Auto-move: pinned → permanent/ ---
-        # --- 自动移动：钉选 → permanent/ ---
-        # NOTE: resolved buckets are NOT auto-archived here.
-        # They stay in dynamic/ and decay naturally until score < threshold.
-        # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
-        domain: list[str] = post.get("domain") or ["未分类"]  # type: ignore[assignment]
-        if kwargs.get("pinned") and post.get("type") != "permanent":
-            post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
-        # --- Reverse: unpin → demote only buckets that were actually pinned.
-        # `type=permanent` is also a first-class bucket type, so an idempotent
-        # pinned=False update must not move explicit permanent memories.
-        elif (
-            "pinned" in kwargs
-            and not kwargs.get("pinned")
-            and was_pinned
-            and not post.get("protected")
-            and post.get("type") == "permanent"
-        ):
-            post["type"] = "dynamic"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.dynamic_dir, domain)
+        derived_state = {
+            "bucket_id": bucket_id,
+            "content": post.content or "",
+            "meaning": post.get("meaning") or [],
+            "queue_content": "content" in kwargs,
+            "queue_meaning": (
+                "meaning" in kwargs or "meaning_append" in kwargs
+            ),
+        }
+        _derived_state_out.clear()
+        _derived_state_out.update(derived_state)
+
+        if bump_active:
+            self._cache_bump(
+                bucket_id,
+                last_active=post["last_active"],
+                activation_count=post["activation_count"],
+                file_path=committed_path,
+            )
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
 
-        # --- iter 2.1+: content 改动 → 同步刷新 embedding ---
-        # 之前 update() 只写文件、不动向量，调用方各自记得调 generate_and_store。
-        # 漏一处就出现「向量是旧文本的，breath 检索拿到的桶语义对不上」的隐性 bug。
-        # 这里把刷新内聚进来，重复调用是幂等的（INSERT OR REPLACE），调用方多调一次也无害。
-        if "content" in kwargs:
-            await self._sync_embedding(bucket_id, post.content or "")
+        # 这里故意不等待 provider 派生索引：所有调用方执行 _update_locked() 时都持有
+        # 桶租约；由公开包装层/调用点在本方法返回并释放租约后刷新 content/meaning 向量。
         self._invalidate_bm25()
+        self._record_v3_bucket_event(
+            "update",
+            bucket_id,
+            str(post.get("type") or "dynamic"),
+            post.content or "",
+            dict(post.metadata),
+        )
+        self._record_ledger_event(
+            "TraceUpdated",
+            bucket_id,
+            str(post.get("type") or "dynamic"),
+            post.content or "",
+            dict(post.metadata),
+            {"changed_fields": sorted(str(k) for k in kwargs.keys())},
+        )
 
         return True
+
+    async def hard_delete_test_bucket(self, bucket_id: str, *, reason: str = "") -> dict:
+        """Erase only a bucket born as test data, with an explicit audit reason."""
+        async with self._bucket_turn(bucket_id):
+            result = await self._hard_delete_test_bucket_locked(
+                bucket_id, reason=reason
+            )
+        if result.get("ok"):
+            await self._discard_derived_index_if_terminal(bucket_id)
+        return result
+
+    async def _hard_delete_test_bucket_locked(
+        self,
+        bucket_id: str,
+        *,
+        reason: str = "",
+    ) -> dict:
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return {"ok": False, "error": "not_found"}
+        try:
+            post = frontmatter.load(file_path)
+        except Exception as exc:
+            return {"ok": False, "error": f"read_failed: {exc}"}
+        provenance = post.get("provenance")
+        if not (isinstance(provenance, dict)
+                and provenance.get("kind") == "test"
+                and provenance.get("erasable") is True):
+            return {"ok": False, "error": "not_erasable_test_data"}
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            return {"ok": False, "error": "missing_delete_reason"}
+        if len(normalized_reason) > 500:
+            return {"ok": False, "error": "delete_reason_too_long"}
+        bucket_type = str(post.get("type") or "dynamic")
+        try:
+            os.remove(file_path)
+        except OSError as exc:
+            return {"ok": False, "error": f"delete_failed: {exc}"}
+        self._invalidate_bm25()
+        self._record_ledger_event(
+            "TraceHardDeleted", bucket_id, bucket_type, "",
+            {"provenance": {"kind": "test", "erasable": True}},
+            {"reason": normalized_reason, "content_erased": True},
+        )
+        logger.warning("Physically erased test bucket: %s", bucket_id)
+        return {"ok": True, "deleted": bucket_id}
 
     # ---------------------------------------------------------
     # Wikilink injection — DISABLED
@@ -708,6 +2578,105 @@ class BucketManager:
         F-10: 记忆不消失，只是淡去。不做物理删除，将文件移入 archive/
         并在 frontmatter 中写入 deleted_at 时间戳；embedding 仍清理以节省空间。
         """
+        async with self._bucket_turn(bucket_id):
+            deleted = await self._delete_locked(bucket_id)
+        if deleted:
+            await self._discard_derived_index_if_terminal(bucket_id)
+        return deleted
+
+    async def restore_archived(self, bucket_id: str) -> dict:
+        """Restore an archived/tombstoned Markdown bucket to its original channel.
+
+        Discovery never calls this method.  It is deliberately exposed only
+        through an explicit ``trace(..., restore=True)`` decision.
+        """
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return {"ok": False, "error": "not_found"}
+            try:
+                post = frontmatter.load(file_path)
+            except Exception as exc:
+                return {"ok": False, "error": f"read_failed: {exc}"}
+
+            normalized_path = os.path.normcase(os.path.abspath(file_path))
+            normalized_archive = os.path.normcase(os.path.abspath(self.archive_dir))
+            try:
+                stored_in_archive = (
+                    os.path.commonpath((normalized_path, normalized_archive))
+                    == normalized_archive
+                )
+            except ValueError:
+                stored_in_archive = False
+            archived_state = (
+                stored_in_archive
+                or str(post.get("type") or "").strip().lower() == "archived"
+                or bool(post.get("deleted_at"))
+                or parse_bool(post.get("tombstone"), default=False)
+            )
+            if not archived_state:
+                return {"ok": False, "error": "not_archived"}
+
+            original_kind = self.footprint_snapshot().original_kind(
+                bucket_id, dict(post.metadata)
+            )
+            if original_kind not in _EDITABLE_BUCKET_TYPES:
+                original_kind = "dynamic"
+            if parse_bool(post.get("pinned"), default=False) or parse_bool(
+                post.get("protected"), default=False
+            ):
+                original_kind = "permanent"
+
+            post["type"] = original_kind
+            for field in (
+                "deleted_at", "tombstone", "tombstoned_at", "erasure_mode"
+            ):
+                post.metadata.pop(field, None)
+            try:
+                target_path = self._bucket_target_path(
+                    file_path,
+                    original_kind,
+                    post.get("domain") or [_DEFAULT_DOMAIN_NAME],
+                    str(post.get("status") or "active"),
+                )
+                committed_path = self._commit_bucket_update(
+                    file_path, target_path, frontmatter.dumps(post)
+                )
+            except (OSError, ValueError) as exc:
+                logger.error("Failed to restore archived bucket %s: %s", bucket_id, exc)
+                return {"ok": False, "error": f"restore_failed: {exc}"}
+
+            self._invalidate_bm25()
+            self._record_v3_bucket_event(
+                "restore", bucket_id, original_kind, post.content or "", dict(post.metadata)
+            )
+            self._record_ledger_event(
+                "TraceRestored",
+                bucket_id,
+                original_kind,
+                post.content or "",
+                dict(post.metadata),
+            )
+            logger.info("Restored archived bucket: %s -> %s", bucket_id, committed_path)
+            result = {"ok": True, "restored": bucket_id, "type": original_kind}
+            meaning_changed = bool(post.get("meaning"))
+            derived_state = {
+                "bucket_id": bucket_id,
+                "content": post.content or "",
+                "meaning": post.get("meaning") or [],
+                "queue_content": True,
+                "queue_meaning": meaning_changed,
+            }
+
+        self._queue_captured_derived_state(derived_state)
+        await self._index_after_update(
+            bucket_id,
+            content_changed=True,
+            meaning_changed=meaning_changed,
+        )
+        return result
+
+    async def _delete_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -715,7 +2684,11 @@ class BucketManager:
         # --- 读取文件，写入 deleted_at，移入 archive/ ---
         try:
             post = frontmatter.load(file_path)
-            post["deleted_at"] = now_iso()
+            tombstone_at = now_iso()
+            post["deleted_at"] = tombstone_at
+            post["tombstone"] = True
+            post["tombstoned_at"] = tombstone_at
+            post["erasure_mode"] = "tombstone_only"
             os.makedirs(self.archive_dir, exist_ok=True)
             dest = os.path.join(self.archive_dir, os.path.basename(file_path))
             # 若 archive/ 里已有同名文件（极罕见），追加 bucket_id 后缀避免覆盖
@@ -724,23 +2697,31 @@ class BucketManager:
                     self.archive_dir,
                     f"{os.path.splitext(os.path.basename(file_path))[0]}_{bucket_id}.md",
                 )
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            if dest != file_path:
-                os.remove(file_path)
+            self._commit_bucket_update(
+                file_path,
+                str(dest),
+                frontmatter.dumps(post),
+            )
         except OSError as e:
             logger.error(f"Failed to soft-delete bucket / 软删除桶文件失败: {file_path}: {e}")
             return False
 
-        # iter 1.6 §4：仍清理 embedding，避免孤儿向量占用空间
-        if self.embedding_engine is not None:
-            try:
-                self.embedding_engine.delete_embedding(bucket_id)
-            except Exception as e:
-                logger.warning(f"delete embedding failed for {bucket_id}: {e}")
-
         self._invalidate_bm25()
         logger.info(f"Soft-deleted bucket (moved to archive) / 软删除记忆桶: {bucket_id}")
+        self._record_v3_bucket_event(
+            "delete",
+            bucket_id,
+            str(post.get("type") or "dynamic"),
+            post.content or "",
+            dict(post.metadata),
+        )
+        self._record_ledger_event(
+            "TraceDeletedToArchive",
+            bucket_id,
+            str(post.get("type") or "dynamic"),
+            post.content or "",
+            dict(post.metadata),
+        )
         return True
 
     # ---------------------------------------------------------
@@ -749,31 +2730,70 @@ class BucketManager:
     # Called on every recall hit; affects decay score.
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
-    async def touch(self, bucket_id: str) -> None:
+    async def touch(self, bucket_id: str, ripple: bool = True) -> None:
         """
         Update a bucket's last activation time and count.
         Also triggers time ripple: nearby memories get a slight activation boost.
         更新桶的最后激活时间和激活次数。
         同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
+
+        ripple=False 可跳过读全库的时间涟漪（性能 P2：批量浮现时不值当为它多跑 list_all）。
         """
+        # Commit the source touch first, then release its turn before taking
+        # any neighbour turns.  Keeping the source lock while acquiring a
+        # target lock lets concurrent A->B and B->A ripples deadlock.
+        async with self._bucket_turn(bucket_id):
+            reference_time = await self._touch_locked(bucket_id)
+        if ripple and reference_time is not None:
+            await self._time_ripple(bucket_id, reference_time)
+
+    async def _touch_locked(self, bucket_id: str) -> datetime | None:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
-            return
+            return None
 
         try:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = int(post.get("activation_count") or 0) + 1  # type: ignore[call-overload]
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write_text(file_path, frontmatter.dumps(post))
+            self._cache_bump(
+                bucket_id,
+                last_active=post["last_active"],
+                activation_count=post["activation_count"],
+                file_path=file_path,
+            )
 
-            # --- Time ripple: boost nearby memories within ±48h ---
-            # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
-            await self._time_ripple(bucket_id, current_time)
+            current_time = parse_iso_datetime(
+                post.get("created", post.get("last_active", ""))
+            )
+            self._record_ledger_event(
+                "TraceTouched",
+                bucket_id,
+                str(post.get("type") or "dynamic"),
+                post.content or "",
+                dict(post.metadata),
+            )
+            return current_time
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+            return None
+
+    async def touch_many(self, bucket_ids: list, ripple: bool = False) -> None:
+        """批量 touch（性能 P2）：breath 浮现后一次性更新一批桶的激活，供后台任务调用。
+
+        ripple 默认 False —— 时间涟漪是「可选的激活微调」，在批量浮现时不值当为它多跑
+        list_all；需要时可显式开启（只对第一个桶做一次涟漪，避免 N×list_all）。
+        单条失败不影响其他。
+        """
+        first = True
+        for bid in bucket_ids:
+            try:
+                await self.touch(bid, ripple=ripple and first)
+            except Exception as e:
+                logger.warning(f"touch_many: 触碰 {bid} 失败: {e}")
+            first = False
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = _RIPPLE_HOURS) -> None:
         """
@@ -792,37 +2812,69 @@ class BucketManager:
                 break
             if bucket["id"] == source_id:
                 continue
-            meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel
-            if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
+            target_id = str(bucket.get("id") or "")
+            if not target_id:
                 continue
 
-            created_str = meta.get("created", meta.get("last_active", ""))
+            # The list_all row is only a candidate snapshot.  Take the normal
+            # target turn, locate it again and re-read all eligibility fields
+            # before writing so a concurrent edit/archive/delete cannot be
+            # overwritten or resurrected from stale data.
             try:
-                created = datetime.fromisoformat(str(created_str))
-                delta_hours = abs((reference_time - created).total_seconds()) / 3600
-            except (ValueError, TypeError):
-                continue
+                async with self._bucket_turn(target_id):
+                    file_path = self._find_bucket_file(target_id)
+                    if not file_path:
+                        continue
+                    normalized_path = os.path.normcase(os.path.abspath(file_path))
+                    active = False
+                    for active_dir in self._active_dirs:
+                        normalized_dir = os.path.normcase(os.path.abspath(active_dir))
+                        try:
+                            if os.path.commonpath((normalized_path, normalized_dir)) == normalized_dir:
+                                active = True
+                                break
+                        except ValueError:
+                            continue
+                    if not active:
+                        continue
 
-            if delta_hours <= hours:
-                # Boost activation_count by _RIPPLE_BOOST (fractional), don't change last_active
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
-                try:
                     post = frontmatter.load(file_path)
+                    if str(post.get("id") or target_id) != target_id:
+                        continue
+                    if (
+                        parse_bool(post.get("pinned"), default=False)
+                        or parse_bool(post.get("protected"), default=False)
+                        or parse_bool(post.get("tombstone"), default=False)
+                        or post.get("deleted_at")
+                        or str(post.get("type") or "dynamic").strip().lower()
+                        in ("permanent", "feel", "archived")
+                    ):
+                        continue
+
+                    created_str = post.get("created", post.get("last_active", ""))
+                    created = parse_iso_datetime(created_str)
+                    delta_hours = abs((reference_time - created).total_seconds()) / 3600
+                    if delta_hours > hours:
+                        continue
+
                     current_count = float(post.get("activation_count") or 0)  # type: ignore[arg-type]
+                    if not math.isfinite(current_count) or current_count < 0:
+                        current_count = 0.0
                     # Store as float for fractional increments; calculate_score handles it
                     post["activation_count"] = round(current_count + _RIPPLE_BOOST, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
-                    rippled += 1
-                except Exception as _ripple_exc:
-                    logger.warning(
-                        f"[ripple] Failed to update activation_count for {bucket['id']!r}: "
-                        f"{type(_ripple_exc).__name__}: {_ripple_exc}"
+                    _atomic_write_text(file_path, frontmatter.dumps(post))
+                    self._cache_bump(
+                        target_id,
+                        activation_count=post["activation_count"],
+                        file_path=file_path,
                     )
-                    continue
+                    rippled += 1
+            except Exception as _ripple_exc:
+                logger.warning(
+                    f"[ripple] Failed to update activation_count for {target_id!r}: "
+                    f"{type(_ripple_exc).__name__}: {_ripple_exc}"
+                )
+                continue
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
@@ -848,6 +2900,8 @@ class BucketManager:
         domain_filter: Optional[list[str]] = None,
         query_valence: Optional[float] = None,
         query_arousal: Optional[float] = None,
+        vector_scores: Optional[dict[str, float]] = None,
+        include_archive: bool = False,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -862,10 +2916,24 @@ class BucketManager:
         limit = limit or self.max_results
         # 字面召回：把查询原样（小写、去空白）留作子串匹配，保证显式搜的词必被召回
         q_norm = query.strip().lower()
-        all_buckets = await self.list_all(include_archive=False)
+        all_buckets = await self.list_all(include_archive=include_archive)
 
         if not all_buckets:
             return []
+
+        # --- Layer 0: bucket-id 直达通道（纯定位，短路）---
+        # bucket id 是随机 hex、**没有语义**，不该进向量/BM25/模糊通道（塞进去只会
+        # 污染语义空间）。这里独立做「完整 id 精确匹配」：查询串正好等于某个可见桶的
+        # 完整 id → 直接返回该桶（满分），绕开语义排序。「我知道要哪条」的精确定位。
+        # 只认完整 id（不做前缀匹配），避免普通关键词误触；软删除/归档桶不在 all_buckets
+        # 中，故按 id 也搜不到已删除桶，与 get() 的可见性一致。
+        q_exact = query.strip()
+        if q_exact:
+            for b in all_buckets:
+                if str(b.get("id")) == q_exact:
+                    hit = dict(b)
+                    hit["score"] = 1.0
+                    return [hit]
 
         # --- Layer 1: domain pre-filter (fast scope reduction) ---
         # --- 第一层：主题域预筛（快速缩小范围）---
@@ -888,8 +2956,19 @@ class BucketManager:
         #     只要查询命中过任意向量，就会被整体过滤掉 → breath 检索数对不上 pulse。
         # 修复：保留 vector_scores 给 Layer 2 的 semantic 维度用，但不动 candidates。
         # 没 embedding 的桶 semantic_score=0，仍可凭 topic/emotion/time/importance 命中。
-        vector_scores: dict[str, float] = {}
-        if self.embedding_engine and self.embedding_engine.enabled:
+        # ``None`` means this caller wants BucketManager to query the engine.
+        # An explicit dict (including {}) lets an orchestration layer perform
+        # the query once and reuse the same scores for ranking and recall.
+        vector_scores_provided = vector_scores is not None
+        if vector_scores is None:
+            vector_scores = {}
+        else:
+            vector_scores = dict(vector_scores)
+        if (
+            not vector_scores_provided
+            and self.embedding_engine
+            and self.embedding_engine.enabled
+        ):
             try:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=_VECTOR_TOPK)
                 if vector_results:
@@ -897,12 +2976,19 @@ class BucketManager:
             except Exception as e:
                 logger.warning(f"Embedding score failed, using fuzzy only / embedding 评分失败: {e}")
 
-        # --- BM25 懒重建 ---
-        # all_buckets 已在上方加载，直接复用；写操作后脏标记触发重建
-        if self._bm25 is not None and self._bm25_dirty:
-            self._bm25.build(all_buckets)
-            self._bm25_dirty = False
-        bm25_scores: dict[str, float] = self._bm25.score(query) if self._bm25 is not None else {}
+        # --- BM25 打分（性能 P4：脏了就后台线程重建，不在请求里同步阻塞 ~17s）---
+        # 脏且没人在重建 → 起一个后台重建；本次查询用「当前索引」打分（首次为空，
+        # 之后是上一版，略旧但有效）。向量+模糊+字面召回仍在，单次查询不会因 BM25 卡住。
+        bm25_scores: dict[str, float] = {}
+        if self._bm25 is not None:
+            if self._bm25_dirty and not self._bm25_rebuilding:
+                self._bm25_rebuilding = True
+                asyncio.create_task(self._rebuild_bm25_async(all_buckets))
+            try:
+                bm25_scores = self._bm25.score(query)
+            except Exception as e:
+                logger.warning(f"[bm25] score 失败，本次跳过 BM25 维度: {e}")
+                bm25_scores = {}
 
         # --- Layer 2: weighted multi-dim ranking ---
         # --- 第二层：多维加权精排 ---
@@ -953,8 +3039,8 @@ class BucketManager:
                 )
                 # Dim 6: semantic similarity — only when embedding is available (iter 2.1)
                 # 仅 embedding 可用时加入语义相似度维度；不可用时不影响 weight_sum 平衡
-                if vector_scores:
-                    semantic_score = vector_scores.get(bucket["id"], 0.0)
+                semantic_score = vector_scores.get(bucket["id"])
+                if semantic_score is not None:
                     total += semantic_score * self.w_semantic
                     weight_sum += self.w_semantic
                 # Dim 7: BM25 TF-IDF 关键词分（rank_bm25+jieba，软依赖，缺包时 bm25_scores={}）
@@ -973,12 +3059,21 @@ class BucketManager:
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
-                if normalized >= self.fuzzy_threshold or literal_hit:
+                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                semantic_match = (
+                    semantic_score is not None
+                    and semantic_score >= _VECTOR_RECALL_THRESHOLD
+                )
+                if text_match or semantic_match:
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):
                         normalized *= _RESOLVED_RANK_PENALTY
                     bucket["score"] = round(normalized, 2)
+                    if semantic_match and not text_match:
+                        bucket["vector_match"] = True
+                    else:
+                        bucket.pop("vector_match", None)
                     scored.append(bucket)
             except Exception as e:
                 logger.warning(
@@ -991,94 +3086,23 @@ class BucketManager:
         return scored[:limit]
 
     # ---------------------------------------------------------
-    # Topic relevance sub-score:
-    # name(×3) + domain(×2.5) + tags(×2) + body(×1)
-    # 文本相关性子分：桶名(×3) + 主题域(×2.5) + 标签(×2) + 正文(×1)
+    # 四个评分维度的纯函数实现已拆到 ombrebrain.retrieval.bucket_scoring；这里保留同名
+    # wrapper 方法 —— 测试和历史调用方一直用 bucket_mgr._calc_xxx_score(...)
+    # 这种实例方法写法，wrapper 保持该接口不变，同时让实现本身可独立单测/复用。
     # ---------------------------------------------------------
     def _calc_topic_score(self, query: str, bucket: dict) -> float:
-        """
-        Calculate text dimension relevance score (0~1).
-        计算文本维度的相关性得分。
-        """
-        meta = bucket.get("metadata", {})
+        return calc_topic_score(query, bucket, content_weight=self.content_weight)
 
-        name_score = fuzz.partial_ratio(query, meta.get("name", "")) * _TOPIC_NAME_W
-        domain_score = (
-            max(
-                (fuzz.partial_ratio(query, d) for d in meta.get("domain", [])),
-                default=0,
-            )
-            * _TOPIC_DOMAIN_W
-        )
-        tag_score = (
-            max(
-                (fuzz.partial_ratio(query, tag) for tag in meta.get("tags", [])),
-                default=0,
-            )
-            * _TOPIC_TAG_W
-        )
-        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:_TOPIC_BODY_SLICE]) * self.content_weight
-
-        return (name_score + domain_score + tag_score + content_score) / (
-            100 * (_TOPIC_NAME_W + _TOPIC_DOMAIN_W + _TOPIC_TAG_W + self.content_weight)
-        )
-
-    # ---------------------------------------------------------
-    # Emotion resonance sub-score:
-    # Based on Russell circumplex Euclidean distance
-    # 情感共鸣子分：基于环形情感模型的欧氏距离
-    # No emotion in query → neutral 0.5 (doesn't affect ranking)
-    # ---------------------------------------------------------
     def _calc_emotion_score(
         self, q_valence: Optional[float], q_arousal: Optional[float], meta: dict
     ) -> float:
-        """
-        Calculate emotion resonance score (0~1, closer = higher).
-        计算情感共鸣度（0~1，越近越高）。
-        """
-        if q_valence is None or q_arousal is None:
-            return 0.5  # No emotion coordinates → neutral / 无情感坐标时给中性分
+        return calc_emotion_score(q_valence, q_arousal, meta)
 
-        try:
-            b_valence = float(meta.get("valence", _DEFAULT_VALENCE))
-            b_arousal = float(meta.get("arousal", _DEFAULT_AROUSAL))
-        except (ValueError, TypeError):
-            return 0.5
-
-        # Euclidean distance, max sqrt(2) ≈ 1.414
-        dist = math.sqrt((q_valence - b_valence) ** 2 + (q_arousal - b_arousal) ** 2)
-        return max(0.0, 1.0 - dist / _EMOTION_MAX_DIST)
-
-    # ---------------------------------------------------------
-    # Time proximity sub-score:
-    # More recent activation → higher score
-    # 时间亲近子分：距上次激活越近分越高
-    # ---------------------------------------------------------
     def _calc_time_score(self, meta: dict) -> float:
-        """
-        Calculate time proximity score (0~1, more recent = higher).
-        计算时间亲近度。
-        """
-        last_active_str = meta.get("last_active", meta.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days = _TIME_FALLBACK_DAYS
-        return math.exp(-_TIME_DECAY_LAMBDA * days)
+        return calc_time_score(meta)
 
-    # ---------------------------------------------------------
-    # Touch frequency sub-score (iter 2.1)
-    # 触碰频率子分：被主动召回次数越多分越高
-    # ---------------------------------------------------------
     def _calc_touch_score(self, meta: dict) -> float:
-        """
-        Calculate touch frequency score (0~1).
-        Normalizes activation_count over 10; capped at 1.0.
-        计算触碰频率得分（0~1），以 10 次为上限归一化。
-        """
-        count = float(meta.get("activation_count") or 0)
-        return min(count / _TOUCH_NORMALIZE_CAP, 1.0)
+        return calc_touch_score(meta)
 
     # ---------------------------------------------------------
     # iter 2.0: anchor 系统（坐标系桶，硬上限 24）
@@ -1099,11 +3123,20 @@ class BucketManager:
 
         Returns: {"ok": bool, "anchor": bool, "count": int, "limit": int, "error": Optional[str]}
         """
+        # anchor 上限 24 是「先数后写」的两步操作；没有这把锁，两个并发
+        # set_anchor(True) 都能在对方提交前读到同一个 count<limit，一起通过
+        # 检查后各自 update()，把总数冲破硬上限。
+        async with _filesystem_turn(str(self.base_dir), "quota-anchor"):
+            return await self._set_anchor_locked(bucket_id, value)
+
+    async def _set_anchor_locked(self, bucket_id: str, value: bool) -> dict:
         bucket = await self.get(bucket_id)
         if not bucket:
             return {"ok": False, "error": "bucket not found", "count": 0, "limit": self.ANCHOR_LIMIT}
-        current_value = bool(bucket["metadata"].get("anchor", False))
-        target = bool(value)
+        current_value = parse_bool(
+            bucket["metadata"].get("anchor", False), default=False
+        )
+        target = parse_bool(value)
         # Idempotent: same state → noop
         if current_value == target:
             count = await self.count_anchors()
@@ -1186,17 +3219,93 @@ class BucketManager:
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
         """
-        buckets = []
-        dirs = list(self._active_dirs)
         if include_archive:
-            dirs.append(self.archive_dir)
+            buckets = []
+            dirs = list(self._active_dirs) + [self.archive_dir]
+            for _root, _fname, file_path in self._iter_md_files(dirs):
+                bucket = self._load_bucket(file_path)
+                if bucket:
+                    buckets.append(bucket)
+            return buckets
 
-        for _root, _fname, file_path in self._iter_md_files(dirs):
-            bucket = self._load_bucket(file_path)
-            if bucket:
-                buckets.append(bucket)
+        # Active buckets use a parsed cache, but Obsidian/Git/manual edits may
+        # bypass BucketManager.  The build mutex is cross-loop; the short state
+        # guard and generation form a CAS with every managed write.  File state
+        # is scanned both before and after parsing so an external editor cannot
+        # make us publish old content paired with a new fingerprint.
+        async with self._active_cache_lock:
+            previous_cache: list[dict] | None = None
+            while True:
+                now = time.monotonic()
+                with self._active_cache_state_guard:
+                    generation = self._active_cache_generation
+                    cached = self._active_cache
+                    if cached is not None:
+                        poll_due = (
+                            self.external_change_poll_seconds == 0
+                            or now - self._last_file_state_check
+                            >= self.external_change_poll_seconds
+                        )
+                        if not poll_due:
+                            return [dict(bucket) for bucket in cached]
+                        cached_state = dict(self._active_file_state)
+                    else:
+                        poll_due = False
+                        cached_state = {}
 
-        return buckets
+                if cached is not None and poll_due:
+                    current_state = self._scan_active_file_state()
+                    with self._active_cache_state_guard:
+                        if generation != self._active_cache_generation:
+                            previous_cache = None
+                            continue
+                        self._last_file_state_check = now
+                        if current_state == cached_state:
+                            current_cache = self._active_cache
+                            if current_cache is not None:
+                                return [dict(bucket) for bucket in current_cache]
+                            continue
+
+                        previous_cache = [dict(bucket) for bucket in cached]
+                        self._active_cache_generation += 1
+                        generation = self._active_cache_generation
+                        self._active_cache = None
+                        self._active_file_state = {}
+                        self._bm25_dirty = True
+                        self._external_changes_detected += 1
+                        self._last_external_change = now_iso()
+                        with self._bucket_path_index_guard:
+                            self._bucket_path_index_ready = False
+                            self._bucket_path_index = {}
+
+                with self._active_cache_state_guard:
+                    generation = self._active_cache_generation
+
+                state_before = self._scan_active_file_state()
+                buckets = []
+                for _root, _fname, file_path in self._iter_md_files(
+                    self._active_dirs
+                ):
+                    bucket = self._load_bucket(file_path)
+                    if bucket:
+                        buckets.append(bucket)
+                state_after = self._scan_active_file_state()
+
+                if state_before != state_after:
+                    await asyncio.sleep(0)
+                    continue
+
+                with self._active_cache_state_guard:
+                    if generation != self._active_cache_generation:
+                        previous_cache = None
+                        continue
+                    self._active_cache = [dict(bucket) for bucket in buckets]
+                    self._active_file_state = state_after
+                    self._last_file_state_check = time.monotonic()
+
+                if previous_cache is not None:
+                    self._reconcile_external_changes(previous_cache, buckets)
+                return buckets
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
@@ -1255,6 +3364,10 @@ class BucketManager:
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
         """
+        async with self._bucket_turn(bucket_id):
+            return await self._archive_locked(bucket_id)
+
+    async def _archive_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1268,15 +3381,21 @@ class BucketManager:
             os.makedirs(archive_subdir, exist_ok=True)
 
             dest = safe_path(archive_subdir, os.path.basename(file_path))
+            # 防撞名：archive/ 里已有同名文件时，追加 bucket_id 后缀，避免
+            # 把一条早先归档的记忆悄悄覆盖掉（与 delete() 的软删除保护一致）。
+            if os.path.exists(dest) and os.path.abspath(dest) != os.path.abspath(file_path):
+                stem = os.path.splitext(os.path.basename(file_path))[0]
+                dest = safe_path(archive_subdir, f"{stem}_{bucket_id}.md")
 
-            # Update type marker then move file / 更新类型标记后移动文件
+            # Commit the archived metadata at the destination before removing
+            # the untouched source.  A failed move must not leave an
+            # ``type=archived`` file stranded in an active directory.
             post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-
-            # Use shutil.move for cross-filesystem safety
-            # 使用 shutil.move 保证跨文件系统安全
-            shutil.move(file_path, str(dest))
+            self._commit_bucket_update(
+                file_path,
+                str(dest),
+                frontmatter.dumps(post),
+            )
         except Exception as e:
             logger.error(
                 f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
@@ -1285,6 +3404,20 @@ class BucketManager:
 
         self._invalidate_bm25()
         logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+        self._record_v3_bucket_event(
+            "archive",
+            bucket_id,
+            str(post.get("type") or "archived"),
+            post.content or "",
+            dict(post.metadata),
+        )
+        self._record_ledger_event(
+            "TraceArchived",
+            bucket_id,
+            str(post.get("type") or "archived"),
+            post.content or "",
+            dict(post.metadata),
+        )
         return True
 
     # ---------------------------------------------------------
@@ -1312,6 +3445,35 @@ class BucketManager:
     # Internal: find bucket file across all three directories
     # 内部：在三个目录中查找桶文件
     # ---------------------------------------------------------
+    def _ensure_bucket_path_index(self) -> None:
+        """Build the complete ID → path index once for bulk conflict checks."""
+
+        with self._bucket_path_index_guard:
+            if self._bucket_path_index_ready:
+                return
+            # 含 archive：软删除后的桶仍然需要可被内部路径查找。
+            dirs = [
+                self.permanent_dir,
+                self.dynamic_dir,
+                self.archive_dir,
+                self.feel_dir,
+                self.plan_dir,
+                self.letter_dir,
+            ]
+            index: dict[str, str] = {}
+            for _root, fname, full_path in self._iter_md_files(dirs):
+                stem = fname[:-3]
+                index.setdefault(stem, full_path)
+                try:
+                    post = frontmatter.load(full_path)
+                    stored_id = str(post.get("id") or "")
+                except Exception:
+                    stored_id = ""
+                if stored_id:
+                    index.setdefault(stored_id, full_path)
+            self._bucket_path_index = index
+            self._bucket_path_index_ready = True
+
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
         """
         Recursively search permanent/dynamic/archive for a bucket file
@@ -1320,24 +3482,45 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        # 含 archive：软删除后的桶仍然需要可被内部路径查找。
-        dirs = [self.permanent_dir, self.dynamic_dir, self.archive_dir,
-                self.feel_dir, self.plan_dir, self.letter_dir]
-        candidates = []
+
+        with self._bucket_path_index_guard:
+            path = self._bucket_path_index.get(bucket_id)
+            if path and os.path.isfile(path):
+                return path
+            if path:
+                # An unmanaged move/delete can invalidate a hit before the
+                # periodic full-vault poll.  Drop it; the next poll rebuilds
+                # the complete index and discovers any replacement location.
+                self._bucket_path_index.pop(bucket_id, None)
+                self._bucket_path_index_ready = False
+            index_ready = self._bucket_path_index_ready
+        if index_ready:
+            return None
+
+        # Preserve the cheap common path for ordinary single-bucket CRUD: most
+        # managed filenames contain the ID, so there is no reason to parse the
+        # full vault merely to serve one get/update.  Bulk migration explicitly
+        # prewarms the complete index via _ensure_bucket_path_index().
+        dirs = [
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.archive_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+        ]
         for _root, fname, full_path in self._iter_md_files(dirs):
-            name_part = fname[:-3]  # remove .md
-            if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
+            stem = fname[:-3]
+            if stem == bucket_id or stem.endswith(f"_{bucket_id}"):
+                with self._bucket_path_index_guard:
+                    self._bucket_path_index[bucket_id] = full_path
                 return full_path
-            candidates.append(full_path)
-        # Fallback: check frontmatter id field (for imported files where filename ≠ id)
-        for full_path in candidates:
-            try:
-                post = frontmatter.load(full_path)
-                if post.get("id") == bucket_id:
-                    return full_path
-            except Exception:
-                pass
-        return None
+
+        # Imported/renamed files may not encode their ID in the filename.
+        self._ensure_bucket_path_index()
+        with self._bucket_path_index_guard:
+            path = self._bucket_path_index.get(bucket_id)
+            return path if path and os.path.isfile(path) else None
 
     # ---------------------------------------------------------
     # Internal: load bucket data from .md file
@@ -1369,12 +3552,107 @@ class BucketManager:
     def _sanitize_float_field(value, default: float) -> float:
         """从任意格式提取 float（兼容 'V0.9'、'[我的视角:V0.3]'、0.9 等老格式）"""
         if isinstance(value, (int, float)):
-            return max(0.0, min(1.0, float(value)))
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                return default
+            return max(0.0, min(1.0, numeric))
         try:
             nums = re.findall(r'[-+]?\d*\.?\d+', str(value))
-            return max(0.0, min(1.0, float(nums[0]))) if nums else default
+            if not nums:
+                return default
+            numeric = float(nums[0])
+            if not math.isfinite(numeric):
+                return default
+            return max(0.0, min(1.0, numeric))
         except Exception:
             return default
+
+    @classmethod
+    def _normalize_metadata_value(
+        cls,
+        value,
+        *,
+        _depth: int = 0,
+        _seen: set[int] | None = None,
+        _budget: list[int] | None = None,
+    ):
+        """Return bounded, alias-free JSON-safe YAML metadata.
+
+        SafeLoader blocks object construction but still permits recursive and
+        exponentially shared aliases.  Reject repeated containers and cap the
+        expansion before rebuilding untrusted frontmatter into ordinary lists.
+        """
+        if _depth > _MAX_METADATA_DEPTH:
+            raise ValueError("bucket metadata exceeds nesting-depth limit")
+        if _seen is None:
+            _seen = set()
+        if _budget is None:
+            _budget = [_MAX_METADATA_NODES]
+        _budget[0] -= 1
+        if _budget[0] < 0:
+            raise ValueError("bucket metadata exceeds node limit")
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            # RFC 8259/JSON has no NaN or infinity.  Normalize YAML's .nan and
+            # .inf scalars to null; known numeric fields below then apply their
+            # documented defaults instead of poisoning dashboard responses.
+            return value if math.isfinite(value) else None
+        if isinstance(value, (bytes, bytearray, memoryview, set, frozenset)):
+            raise ValueError(
+                f"bucket metadata contains non-JSON-safe value: {type(value).__name__}"
+            )
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in _seen:
+                raise ValueError("bucket metadata contains recursive/shared aliases")
+            _seen.add(identity)
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, datetime):
+                    normalized_key = key.isoformat()
+                elif isinstance(key, date):
+                    normalized_key = key.isoformat()
+                elif key is None or isinstance(key, (str, bool, int)):
+                    normalized_key = str(key)
+                elif isinstance(key, float) and math.isfinite(key):
+                    normalized_key = str(key)
+                else:
+                    raise ValueError(
+                        "bucket metadata contains a non-JSON mapping key"
+                    )
+                if normalized_key in normalized:
+                    raise ValueError(
+                        "bucket metadata contains colliding normalized keys"
+                    )
+                normalized[normalized_key] = cls._normalize_metadata_value(
+                    item,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _budget=_budget,
+                )
+            return normalized
+        if isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in _seen:
+                raise ValueError("bucket metadata contains recursive/shared aliases")
+            _seen.add(identity)
+            return [
+                cls._normalize_metadata_value(
+                    v,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _budget=_budget,
+                )
+                for v in value
+            ]
+        raise ValueError(
+            f"bucket metadata contains unsupported scalar: {type(value).__name__}"
+        )
 
     def _load_bucket(self, file_path: str) -> Optional[dict]:
         """
@@ -1383,7 +3661,9 @@ class BucketManager:
         """
         try:
             post = frontmatter.load(file_path)
-            metadata = dict(post.metadata)
+            # Normalize the metadata object as one graph so aliases shared by
+            # different top-level keys cannot reset the node/depth budgets.
+            metadata = self._normalize_metadata_value(dict(post.metadata))
             domain_value = metadata.get("domain")
             if isinstance(domain_value, str):
                 metadata["domain"] = [domain_value] if domain_value.strip() else []
@@ -1392,9 +3672,34 @@ class BucketManager:
             elif not isinstance(domain_value, list):
                 metadata["domain"] = list(domain_value) if isinstance(domain_value, tuple) else [str(domain_value)]
             # 兼容老桶可能存储了 'V0.9'、'[我的视角:V0.3]' 等字符串格式
-            for field, default in (("valence", 0.5), ("arousal", 0.3)):
+            for field, default in (
+                ("valence", 0.5),
+                ("arousal", 0.3),
+                ("model_valence", 0.5),
+                ("weight", 0.5),
+            ):
                 if field in metadata:
                     metadata[field] = self._sanitize_float_field(metadata[field], default)
+            # YAML is an external input boundary (manual files, migration ZIP,
+            # GitHub restore).  Never let arbitrary scalar strings reach JSON
+            # consumers that treat these fields as numbers.
+            metadata["importance"] = _clamp_importance(
+                metadata.get("importance", 5), f"load:{Path(file_path).name}"
+            )
+            try:
+                activation_count = float(metadata.get("activation_count", 0) or 0)
+                if not math.isfinite(activation_count) or activation_count < 0:
+                    raise ValueError("invalid activation_count")
+                metadata["activation_count"] = (
+                    int(activation_count)
+                    if activation_count.is_integer()
+                    else round(activation_count, 3)
+                )
+            except (TypeError, ValueError, OverflowError):
+                metadata["activation_count"] = 0
+            # Defense in depth: future scalar branches must not accidentally
+            # reintroduce NaN/bytes/set values to web JSON consumers.
+            json.dumps(metadata, ensure_ascii=False, allow_nan=False)
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": metadata,

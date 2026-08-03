@@ -13,7 +13,7 @@ I 是 OB 的自我感知层：AI 把关于自己的观察写下来（本质/规�
 - 不做 LLM 分析、不做语义合并，每条自我认知独立存储
 
 不做什么（边界）：
-- 不限制 aspect 值（允许自由维度），有效维度仅做前缀提示
+- aspect 只允许固定维度，防止把任意控制文本混入标签
 - 不压缩、不衰减（type="i" 桶天然排除在 decay 之外，由 decay_engine 配置保证）
 
 对外暴露：i_core(content, aspect, read, limit) → str
@@ -23,6 +23,7 @@ I 是 OB 的自我感知层：AI 把关于自己的观察写下来（本质/规�
 from typing import Optional
 
 from .. import _runtime as rt
+from .._common import check_content_size, check_metadata_size, stored_data_marker
 
 _VALID_ASPECTS = {"nature", "values", "patterns", "limits", "becoming", "uncertainty", "stance"}
 
@@ -33,10 +34,19 @@ async def i_core(
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
 ) -> str:
-    if content is None: content = ""
-    if aspect is None: aspect = ""
-    if read is None: read = False
-    if limit is None: limit = 20
+    content = "" if content is None else str(content)
+    aspect = "" if aspect is None else str(aspect)
+    if read is None:
+        read = False
+    try:
+        limit = max(1, min(100, int(limit if limit is not None else 20)))
+    except (TypeError, ValueError, OverflowError):
+        limit = 20
+    aspect = aspect.strip().lower()
+
+    metadata_err = check_metadata_size(aspect=aspect)
+    if metadata_err:
+        return metadata_err
 
     if rt.mark_op:
         rt.mark_op("I")
@@ -44,8 +54,14 @@ async def i_core(
     await rt.decay_engine.ensure_started()
 
     if read or not content.strip():
-        return await _read_i(int(limit))
-    return await _write_i(content.strip(), aspect.strip())
+        return await _read_i(limit)
+    if aspect and aspect not in _VALID_ASPECTS:
+        choices = ", ".join(sorted(_VALID_ASPECTS))
+        return f"aspect 无效：{aspect}。可选值: {choices}"
+    size_err = check_content_size(content)
+    if size_err:
+        return size_err
+    return await _write_i(content.strip(), aspect)
 
 
 async def _write_i(content: str, aspect: str) -> str:
@@ -107,6 +123,12 @@ async def _read_i(limit: int) -> str:
         ts = (meta.get("last_active") or "")[:10]
         aspect_label = f"[{aspect_tag}] " if aspect_tag else ""
         text = (b.get("content") or "").strip()
-        lines.append(f"\n{ts} {aspect_label}{b['id']}\n{text}")
+        payload = f"{ts} {aspect_label}{b['id']}\n{text}"
+        lines.append(
+            "\n"
+            + stored_data_marker(payload, provenance=f"I:{b['id']}")
+            + "\n"
+            + payload
+        )
 
     return "\n".join(lines)

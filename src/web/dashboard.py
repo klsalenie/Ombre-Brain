@@ -11,7 +11,6 @@ web/dashboard.py — 仪表板页面 + 静态资源 + 健康检查
 """
 
 import os
-import html as _html
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -50,7 +49,7 @@ def register(mcp) -> None:
             # （已纳入 git，未被 .gitignore 排除），最常见原因是克隆/部署了旧版本。
             return HTMLResponse(
                 "<h1>dashboard.html not found</h1>"
-                f"<p>Expected at: <code>{_html.escape(dashboard_path)}</code></p>"
+                "<p>The packaged frontend asset is missing.</p>"
                 "<p>This file ships with the repo (it is committed and NOT git-ignored). "
                 "A missing file almost always means an outdated checkout — "
                 "run <code>git pull origin main</code> / re-clone, or rebuild your Docker image, "
@@ -89,12 +88,10 @@ def register(mcp) -> None:
     @mcp.custom_route("/health", methods=["GET"])
     async def health_check(request: Request) -> Response:
         from starlette.responses import JSONResponse
-        try:
-            stats = await sh.bucket_mgr.get_stats()
-            return JSONResponse({
-                "status": "ok",
-                "buckets": stats["permanent_count"] + stats["dynamic_count"],
-                "decay_engine": "running" if sh.decay_engine.is_running else "stopped",
-            })
-        except Exception as e:
-            return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+        # Public infrastructure probes must be O(1) and reveal no vault size,
+        # engine state, filesystem path, or raw exception.  Authenticated
+        # /api/status and /api/system/diagnostics own detailed health checks.
+        return JSONResponse(
+            {"status": "ok"},
+            headers={"Cache-Control": "no-store"},
+        )

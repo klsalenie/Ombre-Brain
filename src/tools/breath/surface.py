@@ -8,7 +8,8 @@ tools/breath/surface.py — 无 query 浮现模式
 
 关键行为：
 - 排除 anchor 桶（anchor 是坐标系，不主动出现）
-- pinned/protected 桶始终作为「核心准则」置顶（letter 桶即使 importance=10 也不置顶）
+- 排除 digested 桶（已消化记忆只允许显式检索/审计找回）
+- 通过主动浮现策略的 pinned/protected 桶作为「核心准则」置顶（digested、dont_surface、anchor 优先隐藏；letter 桶也不置顶）
 - 未解决桶按 calculate_score 排序；冷启动桶（从未访问且 importance>=8）插队前 2
 - 配置开关 surfacing.sampling.enabled 启用后做加权无放回采样，否则
   保留 top1 + top20 内随机洗牌
@@ -25,16 +26,24 @@ tools/breath/surface.py — 无 query 浮现模式
 
 import random
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 
+from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
-from utils import strip_wikilinks, count_tokens_approx
+from utils import parse_bool, parse_iso_datetime
+from ._verbatim import render_stored_bucket
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
 # 库小且 sampling=ON 时此分支每次 breath 都触发，原本会刷屏；改为 ≥300s
 # 才打一次，并附带本窗口被压制的次数（首次为 0）。
 _FALLBACK_LOG_INTERVAL_SEC = 300
 _fallback_log_state = {"last_ts": 0.0, "suppressed": 0}
+_SURFACE_POLICY = SurfacePolicyVM.default()
+_BUDGET_NOTICE = (
+    "token 预算不足：有 {omitted} 条主要浮现记忆因放不下剩余预算而未返回；"
+    "已返回正文均保持完整，未截断或摘要。"
+    "当前约使用 {used}/{limit} token，如需被省略的整桶请提高 max_tokens 后重试。"
+)
 
 
 def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
@@ -42,6 +51,14 @@ def _bucket_has_tags(meta: dict, tag_filter: list) -> bool:
         return True
     bucket_tags = set(meta.get("tags", []) or [])
     return all(t in bucket_tags for t in tag_filter)
+
+
+def _can_surface(bucket: dict) -> bool:
+    return _SURFACE_POLICY.evaluate_bucket(bucket, mode="spontaneous").allowed
+
+
+def _budget_notice(*, omitted: int, used: int, limit: int) -> str:
+    return _BUDGET_NOTICE.format(omitted=omitted, used=used, limit=limit)
 
 
 async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -> str:
@@ -52,6 +69,18 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         return "记忆系统暂时无法访问。"
 
     surfacing_cfg = rt.config.get("surfacing", {}) or {}
+    try:
+        footprint_snapshot = rt.bucket_mgr.footprint_snapshot()
+    except Exception as exc:
+        rt.logger.warning(f"Footprint snapshot unavailable / 足迹读取失败: {exc}")
+        footprint_snapshot = None
+
+    def _footprint(bucket: dict) -> str:
+        if footprint_snapshot is None:
+            return "👣 Footprint：暂时无法读取"
+        return footprint_snapshot.summary(
+            str(bucket.get("id") or ""), bucket.get("metadata", {})
+        )
 
     # --- pinned/protected 桶置顶（排除 letter 桶：letter 的 importance=10 不代表核心准则）---
     # 注意：pinned 提取在 anchor 过滤 *之前*，保证 anchor+pinned 桶也能出现在核心准则段。
@@ -63,21 +92,31 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             or b["metadata"].get("protected")
             or b["metadata"].get("type") == "permanent"
         )
+        and _can_surface(b)
         and b["metadata"].get("type") != "letter"
         and not b["metadata"].get("anchor", False)  # 防御：anchor 是坐标系，永不主动浮现，即使 pinned
     ]
+    core_filter_notice = ""
+    if tag_filter and pinned_buckets:
+        core_filter_notice = "[说明：tags 仅过滤普通浮现记忆；核心准则按设计始终注入。]"
     pinned_ids = {b["id"] for b in pinned_buckets}
     pinned_results = []
+    token_budget = max_tokens
+    primary_omitted = 0
     for b in pinned_buckets:
         try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+            rendered, entry_tokens = render_stored_bucket(
+                b,
+                f"📌 [核心准则] [bucket_id:{b['id']}]",
+                _footprint(b),
+            )
+            if entry_tokens > token_budget:
+                primary_omitted += 1
+                continue
+            pinned_results.append(rendered)
+            token_budget -= entry_tokens
         except Exception as e:
-            rt.logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-            # 降级：直接展示原文片段，确保核心准则永远可见
-            fallback = strip_wikilinks(b["content"])[:300].strip() or "（空记忆）"
-            pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {fallback}")
+            rt.logger.warning(f"Failed to render pinned bucket / 钉选桶渲染失败: {e}")
 
     # --- iter 2.0: anchor 桶在默认浮现模式的 *未解决池* 不出现（anchor 是坐标系不是浮现对象）---
     # anchor 过滤仅作用于 unresolved 候选，不影响 pinned 提取（上方已完成）。
@@ -86,7 +125,8 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
     # --- 未解决桶 ---
     unresolved = [
         b for b in all_buckets_non_anchor
-        if not b["metadata"].get("resolved", False)
+        if _can_surface(b)
+        and not b["metadata"].get("resolved", False)
         and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self", "i")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
@@ -110,12 +150,17 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         meta = b["metadata"]
         score = rt.decay_engine.calculate_score(meta)
         try:
-            last_ts = datetime.fromisoformat(
-                str(meta.get("last_active") or meta.get("created", ""))
+            last_ts = parse_iso_datetime(
+                meta.get("last_active") or meta.get("created", "")
             ).timestamp()
         except (ValueError, TypeError):
             last_ts = 0.0
-        av = float(meta.get("arousal") or 0.3) * float(meta.get("valence") or 0.5)
+        # `or` 会把合法的 0.0（比如效价/唤醒度恰好为极端值的记忆）当成缺失值
+        # 吞掉，静默换成默认值——用 .get(key, default) 才能保留 0.0 本身。
+        try:
+            av = float(meta.get("arousal", 0.3)) * float(meta.get("valence", 0.5))
+        except (TypeError, ValueError):
+            av = 0.3 * 0.5
         imp = int(meta.get("importance") or 5)
         return (score, last_ts, av, imp)
 
@@ -137,13 +182,10 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
     scored_with_cold = cold_start + scored_deduped
 
     # --- 按 token 预算浮现，加权采样 / 随机洗牌 + 硬上限 ---
-    token_budget = max_tokens
-    for r in pinned_results:
-        token_budget -= count_tokens_approx(r)
-
     candidates = list(scored_with_cold)
     sampling_cfg = surfacing_cfg.get("sampling", {}) or {}
-    if sampling_cfg.get("enabled", False) and len(candidates) > len(cold_start) + 1:
+    sampling_enabled = parse_bool(sampling_cfg.get("enabled", False), default=False)
+    if sampling_enabled and len(candidates) > len(cold_start) + 1:
         n_cold = len(cold_start)
         non_cold = candidates[n_cold:]
         top_k = int(sampling_cfg.get("top_k") or 5)
@@ -168,7 +210,7 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         except Exception as e:
             rt.logger.warning(f"Weighted sampling failed, fallback to original / 加权采样失败: {e}")
     elif len(candidates) > 1:
-        if sampling_cfg.get("enabled", False):
+        if sampling_enabled:
             now_ts = time.monotonic()
             if now_ts - _fallback_log_state["last_ts"] >= _FALLBACK_LOG_INTERVAL_SEC:
                 suppressed = _fallback_log_state["suppressed"]
@@ -193,22 +235,29 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
 
     dynamic_results = []
     for b in candidates:
-        if token_budget <= 0:
-            break
         try:
-            clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-            summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
-                break
             score = rt.decay_engine.calculate_score(b["metadata"])
-            dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-            token_budget -= summary_tokens
+            rendered, entry_tokens = render_stored_bucket(
+                b,
+                f"[权重:{score:.2f}] [bucket_id:{b['id']}]",
+                _footprint(b),
+            )
+            if entry_tokens > token_budget:
+                primary_omitted += 1
+                continue
+            dynamic_results.append(rendered)
+            token_budget -= entry_tokens
         except Exception as e:
-            rt.logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+            rt.logger.warning(f"Failed to render surfaced bucket / 浮现渲染失败: {e}")
             continue
 
     if not pinned_results and not dynamic_results:
+        if primary_omitted:
+            return _budget_notice(
+                omitted=primary_omitted,
+                used=max_tokens - token_budget,
+                limit=max_tokens,
+            )
         if rt.mark_op:
             rt.mark_op("breath_empty")
         stats = await rt.bucket_mgr.get_stats()
@@ -221,14 +270,14 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             )
         return (
             "权重池暂时平静——我手上没什么需要主动浮现的东西。\n"
-            "可以试试 breath(query=\"想找的关键词\") 走检索，\n"
+            "可以试试 breath_search(query=\"想找的关键词\") 走检索，\n"
             "或者 dream() 让我自己挑几段最近的记忆嚼一嚼。"
         )
 
     # --- iter 1.6 §7: passive association ---
     passive_results: list[str] = []
     try:
-        now = datetime.now(timezone.utc)
+        now = datetime.now()
         seven_days_ago = now - timedelta(days=7)
         already = {b["id"] for b in candidates}
         passive_pool = []
@@ -243,22 +292,28 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
             if imp >= 9:
                 last = meta.get("last_active") or meta.get("created", "")
                 try:
-                    last_dt = datetime.fromisoformat(last.replace("Z", "+00:00")) if last else None
+                    last_dt = parse_iso_datetime(last) if last else None
                     if last_dt and last_dt < seven_days_ago:
                         cond_b = True
                 except Exception:
                     cond_b = False
             if cond_a or cond_b:
                 passive_pool.append(b)
-        if passive_pool:
+        if passive_pool and not primary_omitted:
             random.shuffle(passive_pool)
             for b in passive_pool[:2]:
                 try:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    passive_results.append(f"💤 [久未浮现] [bucket_id:{b['id']}] {summary}")
+                    rendered, entry_tokens = render_stored_bucket(
+                        b,
+                        f"💤 [久未浮现] [bucket_id:{b['id']}]",
+                        _footprint(b),
+                    )
+                    if entry_tokens > token_budget:
+                        continue
+                    passive_results.append(rendered)
+                    token_budget -= entry_tokens
                 except Exception as e:
-                    rt.logger.warning(f"passive association dehydrate failed: {e}")
+                    rt.logger.warning(f"passive association render failed: {e}")
     except Exception as e:
         rt.logger.warning(f"passive association block failed: {e}")
 
@@ -266,12 +321,13 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
     # 设计意图：让已解决的记忆有小概率重新出现，制造"忽然想起"的温度。
     # 与无结果兜底逻辑并存；不替换主流程。
     dream_results: list[str] = []
-    if random.random() < 0.03:
+    if not primary_omitted and random.random() < 0.03:
         try:
             shown_ids = {b["id"] for b in candidates}
             resolved_pool = [
                 b for b in all_buckets
-                if b["metadata"].get("resolved", False)
+                if _can_surface(b)
+                and b["metadata"].get("resolved", False)
                 and b["id"] not in shown_ids
                 and b["metadata"].get("type") not in ("feel", "plan", "letter")
                 and not b["metadata"].get("pinned")
@@ -280,16 +336,24 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
                 random.shuffle(resolved_pool)
                 for b in resolved_pool[:3]:
                     try:
-                        clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                        summary = await rt.dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                        dream_results.append(f"✨ [偶遇] [bucket_id:{b['id']}] {summary}")
+                        rendered, entry_tokens = render_stored_bucket(
+                            b,
+                            f"✨ [偶遇] [bucket_id:{b['id']}]",
+                            _footprint(b),
+                        )
+                        if entry_tokens > token_budget:
+                            continue
+                        dream_results.append(rendered)
+                        token_budget -= entry_tokens
                         rt.logger.info(f"Dream surface triggered / 偶遇机制触发: {b['id']}")
                     except Exception as e:
-                        rt.logger.warning(f"Dream surface dehydrate failed / 偶遇脱水失败: {e}")
+                        rt.logger.warning(f"Dream surface render failed / 偶遇渲染失败: {e}")
         except Exception as e:
             rt.logger.warning(f"Dream surface block failed / 偶遇模块异常: {e}")
 
     parts = []
+    if core_filter_notice:
+        parts.append(core_filter_notice)
     if pinned_results:
         parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
     if dynamic_results:
@@ -298,4 +362,12 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         parts.append("=== 久未浮现 ===\n" + "\n---\n".join(passive_results))
     if dream_results:
         parts.append("=== 偶然想起 ===\n" + "\n---\n".join(dream_results))
+    if primary_omitted:
+        parts.append(
+            _budget_notice(
+                omitted=primary_omitted,
+                used=max_tokens - token_budget,
+                limit=max_tokens,
+            )
+        )
     return "\n\n".join(parts)

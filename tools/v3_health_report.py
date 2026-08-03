@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_or_write(report: dict[str, Any], output: Path | None) -> int:
-    text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+    text = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True)
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(text + "\n", encoding="utf-8")
