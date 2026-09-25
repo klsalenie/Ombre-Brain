@@ -124,13 +124,19 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
             }
             index_ids = set(ee.list_all_ids())
             missing = disk_ids - index_ids - pending_ids
-            orphan = index_ids - disk_ids
+            # 归档/软删除的桶仍在盘上，它们的向量不是孤儿：restore 回来还要用，
+            # 而 /api/embedding/backfill 的 known_ids 也不过滤 deleted_at。此处若
+            # 沿用 disk_ids（已排除 deleted_at），两边定义不一致，会报出一个任何
+            # 入口都清不掉的永久假警报。missing 仍用严格的 disk_ids。
+            known_ids = {b["id"] for b in disk_buckets}
+            orphan = index_ids - known_ids
             if missing or orphan:
                 status += (
                     f"⚠️ 索引漂移：缺失 embedding {len(missing)} 个 / "
                     f"孤儿 embedding {len(orphan)} 个 "
-                    f"（缺失项可在 Dashboard 触发补齐；孤儿项可运行 "
-                    f"tools/clean_orphan_embeddings.py 清理）\n"
+                    f"（两者都可在 Dashboard 点「补齐缺失向量」修复：它补齐缺失项，"
+                    f"同时对账清理孤儿项；源码部署也可运行 "
+                    f"tools/clean_orphan_embeddings.py --apply）\n"
                 )
     except Exception as e:
         rt.logger.warning(f"pulse index/storage drift check failed: {e}")
