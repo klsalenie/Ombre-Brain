@@ -15,7 +15,9 @@ pulse 顺带放在这里：它是系统状态 + 桶清单的总览，调用频�
 - pulse：聚合 stats + list_all，按 type 分组（normal/feel/plan/letter）
   逐行展示 icon + 主题 + 情感 + 权重 + 标签
 - pulse 同时附带「索引漂移」自检：embedding.db 的 ID 集合与磁盘桶 ID 集合
-  对账，缺失/孤儿 > 0 时在状态块顶部告警，提示运行 backfill / clean 脚本
+  对账，缺失/孤儿 > 0 时在状态块顶部告警，指向 Dashboard 的「补齐缺失向量」
+  （/api/embedding/backfill 会补缺失项并对账清掉孤儿项）。这里只指向 Dashboard：
+  tools/ 脚本要同时有源码和交互式 shell 才跑得动，PaaS 部署两样都不保证。
 
 不做什么（边界）：
 - anchor 没有「创建快捷键」：必须先 hold() 写下，确认是坐标系再钉
@@ -118,8 +120,9 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
                 status += (
                     f"⚠️ 索引漂移：缺失 embedding {len(missing)} 个 / "
                     f"孤儿 embedding {len(orphan)} 个 "
-                    f"（缺失项可在 Dashboard 触发补齐；孤儿项可运行 "
-                    f"tools/clean_orphan_embeddings.py 清理）\n"
+                    f"（两者都可在 Dashboard 点「补齐缺失向量」修复：它补齐缺失项，"
+                    f"同时对账清理孤儿项；源码部署也可运行 "
+                    f"tools/clean_orphan_embeddings.py --apply）\n"
                 )
     except Exception as e:
         rt.logger.warning(f"pulse index/storage drift check failed: {e}")
